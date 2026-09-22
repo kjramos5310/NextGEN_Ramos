@@ -32,7 +32,7 @@ Las decisiones críticas de diseño son del candidato: arquitectura, modelo de d
 | Microservicio de IA | Servicio FastAPI, consumidor RabbitMQ y motor de reglas (Antigravity); reintentos con DLQ, trazabilidad y reescritura de las reglas de respaldo para que solo usen datos reales (Claude Code). | Uso de un LLM alojado con respaldo por reglas; verificación de la API key con `ai-service/scripts/check_gemini.py`. |
 | ETL | Script de limpieza y *feature engineering* (Antigravity). | Ejecución y verificación de la salida. |
 | Frontend | Componentes de la interfaz (Antigravity); eliminación de valores fijos que aparentaban ser métricas (Claude Code). | Flujo de la demo. |
-| Infraestructura | `docker-compose.yml`, healthchecks y configuración de Postgres para diagnóstico. | Topología de servicios y variables de entorno. |
+| Infraestructura | `docker-compose.yml`, healthchecks y configuración de Postgres para diagnóstico; código de Terraform y del pipeline de GitHub Actions (Claude Code). | Despliegue en Google Cloud con Cloud Run, Terraform y CI/CD; topología de servicios y variables de entorno; ejecución de `terraform apply` y configuración del proyecto. |
 | Documentación | Redacción del documento técnico, diagramas, README y esta declaración. | Contenido revisado contra el código; lo que es diseño y no está implementado se marca como tal. |
 
 ## Proceso de corrección

@@ -61,7 +61,7 @@ El diagrama de secuencia del flujo asíncrono de la IA está en [IA_IMPLEMENTACI
 | Mensajería | RabbitMQ 3.13 | Saca la IA y Bancs del camino crítico de la transferencia. | Colas durables, mensajes persistentes y *publisher confirms*. | Consumidores competitivos por cola; DLQ para mensajes que no se pueden procesar. |
 | IA | Python 3.11 + FastAPI + pika | Proceso y contenedor separados: la inferencia no compite por el event loop del backend. | La API key de Gemini se lee de una variable de entorno y viaja en el header `x-goog-api-key`, no en la URL ([advisor.py](../ai-service/advisor.py)). | Réplicas del consumidor sobre la misma cola (diseño de autoescalado en el documento de IA). |
 | Observabilidad | Winston + prom-client + Prometheus + Grafana | Métricas agregadas de bajo costo. Los logs son JSON en `NODE_ENV=production`. | El correlation ID del cliente se valida (`^[A-Za-z0-9._:-]{1,64}$`) antes de usarse ([correlation-id.middleware.ts](../backend/src/common/middleware/correlation-id.middleware.ts)). | Prometheus federable; los logs JSON se pueden enviar a Loki o ELK (diseño). |
-| IaC | Docker Compose | Un solo comando levanta 7 servicios. Healthchecks en PostgreSQL y RabbitMQ; el backend espera a que ambos estén sanos. | Solo para uso local: credenciales de ejemplo en texto plano. | En producción: Kubernetes + HPA/KEDA (diseño). |
+| IaC | Docker Compose (local) + Terraform (Google Cloud) + GitHub Actions | Un solo comando levanta los 7 servicios en local. En la nube, Terraform crea Cloud Run, Cloud SQL, la VM de RabbitMQ, Secret Manager y Workload Identity Federation; el pipeline prueba, migra y despliega en cada push a `main`. | Compose usa credenciales de ejemplo en texto plano (solo local); en la nube los secretos están en Secret Manager. | Cloud Run escala por instancias; más allá, Kubernetes + HPA/KEDA (diseño). |
 
 ### 1.3. Estrategia para 10.000 TPS (diseño) y qué valida el MVP
 
@@ -459,7 +459,7 @@ Estados: **Implementado** = existe en el código y se puede ejecutar; **Diseño*
 | R3.1c | DML semilla | [seed.sql](../backend/sql/seed.sql), `database/seeds/seed.service.ts` | Implementado |
 | R3.1d | Interacción real con BD | `transactions.service.ts` (TypeORM `QueryRunner` + SQL) | Implementado |
 | R3.1e | Concurrencia sin race conditions, con prueba | Sección 5.2; [concurrency.int-spec.ts](../backend/test/concurrency.int-spec.ts) | Implementado |
-| R3.1f | IaC en un comando | [docker-compose.yml](../docker-compose.yml) | Implementado |
+| R3.1f | IaC en un comando | [docker-compose.yml](../docker-compose.yml); despliegue en la nube con [infra/terraform](../infra/terraform) y [CI/CD](../.github/workflows/ci-cd.yml) | Implementado |
 | R3.2a | Flujo app ↔ Bancs | Sección 2.1 | Parcial (outbox y cola implementados; CDC desde Bancs en diseño) |
 | R3.2b | Saldos sin saturar Bancs | Sección 2.1 (cola durable; worker con rate limiting) | Parcial (cola implementada; worker en diseño) |
 | R3.2c | Script ETL | [etl_bancs_processor.py](../etl-bancs/etl_bancs_processor.py) | Implementado |

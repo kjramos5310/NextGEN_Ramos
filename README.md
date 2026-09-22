@@ -1,5 +1,7 @@
 # SmartBancs App
 
+[![CI/CD](https://github.com/kjramos5310/NextGEN_Ramos/actions/workflows/ci-cd.yml/badge.svg)](https://github.com/kjramos5310/NextGEN_Ramos/actions/workflows/ci-cd.yml)
+
 Prueba técnica TCS NextGen Engineer. SmartBancs es un MVP de plataforma de transferencias bancarias en tiempo real con tres piezas principales:
 
 - **Transferencias ACID con concurrencia controlada.** Locks pesimistas en orden determinista, `lock_timeout`/`statement_timeout`, reintento ante deadlock, `Idempotency-Key` y montos exactos en `NUMERIC`.
@@ -190,6 +192,17 @@ Lee `bancs_raw_transactions.csv` (12 registros) y regenera `bancs_cleaned_featur
 | Pruebas del ai-service | [ai-service/tests/test_consumer.py](ai-service/tests/test_consumer.py) | Mensajes AMQP y respuestas HTTP simuladas. |
 | Simulación de quincena | `POST /api/v1/simulation/quincena-spike` | Hasta 500 transferencias entre las cuentas semilla (`totalRequests` ≤ 500, `concurrentWorkers` ≤ 100). Requiere `SIMULATION_ENABLED=true`. |
 
+## Despliegue en Google Cloud
+
+Además del entorno local, la solución se despliega en Google Cloud con **Terraform** y un pipeline de **GitHub Actions**:
+- Cloud Run para backend, ai-service y frontend, más un job de migración.
+- Cloud SQL (PostgreSQL 16).
+- RabbitMQ en una VM privada.
+- Secret Manager para las credenciales.
+- Workload Identity Federation para que GitHub se autentique sin llaves.
+
+El pipeline corre las pruebas en cada push y pull request, y despliega en cada push a `main`. Los pasos están en [infra/README.md](infra/README.md).
+
 ## Detener
 
 ```bash
@@ -211,7 +224,7 @@ Si levantaste una versión anterior del proyecto, usa `docker compose down -v` a
 │   │   ├── accounts/            cuentas y saldos
 │   │   └── simulation/          pico de quincena y db-diagnostics (SIMULATION_ENABLED)
 │   ├── src/common/              logger, métricas, correlation ID, validación
-│   ├── sql/                     00-observability.sql, schema.sql, seed.sql
+│   ├── sql/                     00-observability.sql, schema.sql, seed.sql, job de migración
 │   └── test/                    pruebas de integración contra PostgreSQL
 ├── ai-service/                  FastAPI + consumidor RabbitMQ + motor Gemini/heurístico
 │   ├── scripts/check_gemini.py  verificación de la API key
@@ -219,6 +232,8 @@ Si levantaste una versión anterior del proyecto, usa `docker compose down -v` a
 ├── etl-bancs/                   ETL del lote crudo de Bancs
 ├── frontend/                    React 18 + Vite + Tailwind
 ├── docker/                      configuración de Prometheus y Grafana
+├── infra/terraform/             Google Cloud: Cloud Run, Cloud SQL, RabbitMQ, secretos, WIF
+├── .github/workflows/ci-cd.yml  pruebas + build + despliegue
 ├── docs/
 │   ├── DOCUMENTO_TECNICO.md
 │   ├── IA_IMPLEMENTACION_Y_DESPLIEGUE.md

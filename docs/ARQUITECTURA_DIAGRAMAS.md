@@ -302,7 +302,43 @@ stateDiagram-v2
     DLQ --> [*]: basic_nack requeue=false, smartbancs.dlx a smartbancs.ai.dlq
 ```
 
-## 9. Entrada para Archify
+## 9. Despliegue en Google Cloud
+
+La misma solución desplegada con Terraform (`infra/terraform/`) y GitHub Actions (`.github/workflows/ci-cd.yml`). RabbitMQ va en una VM porque Cloud Run solo acepta tráfico HTTP entrante. Detalle en [infra/README.md](../infra/README.md).
+
+```mermaid
+flowchart LR
+    dev(["git push a main"]) --> gha["GitHub Actions<br/>tests + build + deploy"]
+    gha -->|"OIDC (Workload Identity<br/>Federation, sin llaves)"| ar["Artifact Registry<br/>imágenes por commit"]
+    user(["Navegador"])
+
+    subgraph gcp["Google Cloud (Terraform)"]
+        fe["Cloud Run<br/>smartbancs-frontend<br/>nginx, min 0"]
+        be["Cloud Run<br/>smartbancs-backend<br/>API + relay, min 1, CPU siempre"]
+        ai["Cloud Run<br/>smartbancs-ai-service<br/>consumidor, min 1, privado"]
+        job["Cloud Run Job<br/>smartbancs-db-migrate"]
+        sql[("Cloud SQL<br/>PostgreSQL 16<br/>Query Insights")]
+        subgraph vpc["VPC smartbancs-vpc 10.10.0.0/24"]
+            mq["Compute Engine<br/>RabbitMQ 3.13<br/>solo IP interna :5672"]
+        end
+        sm["Secret Manager<br/>DB, AMQP, Gemini"]
+    end
+    gem["Gemini API"]
+
+    gha -->|"migra con el job y despliega<br/>imágenes en Cloud Run"| gcp
+    user --> fe
+    user -->|"REST /api/v1"| be
+    be -->|"conector Cloud SQL"| sql
+    job --> sql
+    be -->|"Direct VPC egress<br/>AMQP"| mq
+    mq --> ai
+    ai -->|"POST /recommendations"| be
+    ai --> gem
+    sm -.-> be
+    sm -.-> ai
+```
+
+## 10. Entrada para Archify
 
 Componentes:
 
