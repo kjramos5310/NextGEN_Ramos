@@ -41,7 +41,7 @@ export interface AIRecommendation {
 }
 
 /** Motor que generó la recomendación (lo informa el ai-service en metadata.engine). */
-export type AIEngine = 'gemini-2.5-flash' | 'heuristic-fallback';
+export type AIEngine = 'gemini-3.6-flash' | 'heuristic-fallback';
 
 export interface AIRecommendationMetadata {
   engine?: AIEngine | string;

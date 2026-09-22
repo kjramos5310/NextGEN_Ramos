@@ -181,7 +181,8 @@ def test_gemini_timeout_falls_back(monkeypatch, caplog):
     with caplog.at_level(logging.INFO):
         rec = advisor.analyze_transaction({"accountNumber": "1", "amount": 10})
     assert rec["engine"] == "heuristic-fallback"
-    assert any("> 10 s" in r.getMessage() for r in caplog.records)
+    from advisor import GEMINI_TIMEOUT_SECONDS
+    assert any(f"> {GEMINI_TIMEOUT_SECONDS:.0f} s" in r.getMessage() for r in caplog.records)
     assert not any("dummy-secret-key" in r.getMessage() for r in caplog.records)
 
 
@@ -193,7 +194,8 @@ def test_model_info_is_truthful():
     assert info["dataDriftStatus"] == "not_implemented"
     assert info["dataDriftScore"] is None
     assert info["modelVersion"] == advisor.model_version
-    assert info["geminiTimeoutSeconds"] == 10.0
+    from advisor import GEMINI_TIMEOUT_SECONDS
+    assert info["geminiTimeoutSeconds"] == GEMINI_TIMEOUT_SECONDS
     health = client.get("/health").json()
     assert health["status"] == "DEGRADED"  # consumidor no conectado en la prueba
     assert health["totalInferences"] == advisor.total_inferences

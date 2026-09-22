@@ -73,7 +73,7 @@ export const AIAdvisorFeed: React.FC<AIAdvisorFeedProps> = ({ recommendations, o
             <div className="flex items-center space-x-2">
               <h2 className="text-base font-bold text-white tracking-tight">Motor de Análisis Cognitivo y Gestión de Riesgo</h2>
               <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-blue-500/10 text-blue-300 border border-blue-500/20 font-semibold">
-                Gemini 2.5 Flash · fallback heurístico
+                Gemini 3.6 Flash · fallback heurístico
               </span>
             </div>
             <p className="text-xs text-slate-400">

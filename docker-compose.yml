@@ -45,9 +45,10 @@ services:
       RABBITMQ_DEFAULT_PASS: guest
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
-      interval: 5s
+      interval: 10s
       timeout: 10s
-      retries: 12
+      retries: 10
+      start_period: 60s
     networks:
       - smartbancs-network
 
@@ -99,7 +100,7 @@ services:
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
       BACKEND_API_URL: http://backend:4000
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
-      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.6-flash}
     depends_on:
       - rabbitmq
       - backend

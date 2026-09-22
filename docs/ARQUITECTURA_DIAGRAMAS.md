@@ -25,7 +25,7 @@ flowchart LR
     end
 
     etl["etl-bancs<br/>script Python pandas<br/>ejecución manual, fuera del compose"]
-    gem["Google Gemini API<br/>gemini-2.5-flash<br/>externo, opcional"]
+    gem["Google Gemini API<br/>gemini-3.6-flash<br/>externo, opcional"]
     bancs["Core Bancs legado<br/>externo<br/>(diseño)"]
 
     user -->|"HTTP :3000 estáticos"| fe
@@ -318,7 +318,7 @@ Componentes:
 | smartbancs.ai.dlq | Cola (DLQ) | durable, binding smartbancs.ai.dlq | implementado |
 | smartbancs.bancs.sync.queue | Cola | durable, binding bancs.sync, sin consumidor | implementado (solo cola) |
 | ai-service | Microservicio IA | Python 3.11, FastAPI, uvicorn, pika, requests, puerto 8000 | implementado |
-| Google Gemini API | SaaS externo | gemini-2.5-flash por defecto, opcional (GEMINI_API_KEY) | externo |
+| Google Gemini API | SaaS externo | gemini-3.6-flash por defecto, opcional (GEMINI_API_KEY) | externo |
 | Motor heurístico | Componente del ai-service | reglas locales, fallback | implementado |
 | prometheus | Monitoreo | prom/prometheus v2.51.0, puerto 9090 | implementado |
 | grafana | Dashboards | grafana 10.4.1, puerto 3001->3000 | implementado |

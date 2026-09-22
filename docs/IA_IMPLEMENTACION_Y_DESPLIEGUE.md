@@ -39,7 +39,7 @@ sequenceDiagram
     end
 
     MQ->>AI: smartbancs.ai.queue (prefetch 5, ack manual)
-    AI->>G: generateContent (timeout 10 s), si hay GEMINI_API_KEY
+    AI->>G: generateContent (timeout 15 s, configurable), si hay GEMINI_API_KEY
     G-->>AI: JSON, o error / 429 / timeout -> motor heurístico
     AI->>API: POST /api/v1/recommendations (x-correlation-id), hasta 3 intentos
     API->>DB: INSERT ai_recommendations (idempotente por transaction_id)
@@ -86,16 +86,16 @@ sequenceDiagram
 
 - **Gemini**, si `GEMINI_API_KEY` está definida:
   - `POST https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent`, con la key en el header `x-goog-api-key`.
-  - `GEMINI_MODEL` vale por defecto `gemini-2.5-flash` (también en [docker-compose.yml](../docker-compose.yml) y [.env.example](../.env.example)).
-  - La petición lleva `systemInstruction` y `generationConfig` con `responseMimeType: "application/json"`, `temperature: 0.2`, `maxOutputTokens: 800` y `thinkingConfig.thinkingBudget: 0`. Timeout HTTP: 10 s (`GEMINI_TIMEOUT_SECONDS`).
+  - `GEMINI_MODEL` vale por defecto `gemini-3.6-flash` (también en [docker-compose.yml](../docker-compose.yml) y [.env.example](../.env.example)).
+  - La petición lleva `systemInstruction` y `generationConfig` con `responseMimeType: "application/json"`, `temperature: 0.2`, `maxOutputTokens: 800` y `thinkingConfig.thinkingBudget: 0` (si el modelo rechaza `thinkingConfig`, se reintenta una vez sin él). Timeout HTTP: 15 s por defecto (`GEMINI_TIMEOUT_SECONDS`).
 - **Parseo** (`_clean_and_parse_json`): quita los delimitadores de markdown; si falla, extrae el primer bloque `{...}` con una expresión regular.
 - **Validación del contrato** (`_validate_gemini_result`):
   - `type` debe pertenecer al enum de PostgreSQL y `message` no puede estar vacío.
   - `title` se recorta a 150 caracteres (tamaño de la columna) y `confidenceScore` se acota a [0, 1].
   - Si la respuesta no cumple, se usa el fallback.
-- **Motor heurístico local** (`_heuristic_rule_fallback`): reglas deterministas por categoría y monto, sin red. Se usa cuando no hay key y cuando Gemini responde con error HTTP, 429, timeout, JSON inválido o un contrato inválido.
+- **Motor heurístico local** (`_heuristic_rule_fallback`): reglas deterministas por monto, categoría y proporción del saldo (umbrales explícitos al inicio de `advisor.py`), sin red. Solo afirma datos calculados de la transacción; su `confidenceScore` es un valor fijo (0.5), no una probabilidad calibrada, y `metadata.rule` indica qué regla se aplicó. Se usa cuando no hay key y cuando Gemini responde con error HTTP, 429, timeout, JSON inválido o un contrato inválido.
 - Cada recomendación lleva `engine`: el nombre del modelo de Gemini o `heuristic-fallback`. Es la fuente de verdad de qué motor respondió.
-- **Coste por evento con Gemini degradado:** no hay circuit breaker. Si Gemini está caído o lento, cada evento puede esperar hasta 10 s antes de caer al fallback, y eso limita el ritmo del consumidor. El circuit breaker es diseño (sección 2.3).
+- **Coste por evento con Gemini degradado:** no hay circuit breaker. Si Gemini está caído o lento, cada evento puede esperar hasta 15 s antes de caer al fallback, y eso limita el ritmo del consumidor. El circuit breaker es diseño (sección 2.3).
 
 **Endpoints** ([main.py](../ai-service/main.py)):
 
@@ -117,7 +117,7 @@ sequenceDiagram
 
 ### 1.4. Cómo verificar la API key de Gemini
 
-1. Copiar `.env.example` a `.env` en la raíz y definir `GEMINI_API_KEY`. `GEMINI_MODEL` ya viene en `gemini-2.5-flash`. Sin key, todo funciona con el motor heurístico.
+1. Copiar `.env.example` a `.env` en la raíz y definir `GEMINI_API_KEY`. `GEMINI_MODEL` ya viene en `gemini-3.6-flash`. Sin key, todo funciona con el motor heurístico.
 2. Ejecutar `python ai-service/scripts/check_gemini.py` desde la raíz, con las dependencias de `ai-service/requirements.txt` instaladas. El script ([check_gemini.py](../ai-service/scripts/check_gemini.py)):
    - Carga `.env`.
    - Imprime el modelo y **solo la longitud** de la key.
@@ -200,7 +200,7 @@ ETL diario (Bancs + SmartBancs) -> datos anonimizados -> Feature store
 
 - Contenedor y proceso separados del backend.
 - `prefetch_count=5`, que acota los mensajes en vuelo por consumidor.
-- Timeout de 10 s a Gemini y de 5 s al backend.
+- Timeout de 15 s (configurable) a Gemini y de 5 s al backend.
 - `maxOutputTokens: 800` y `thinkingBudget: 0`, que acotan tokens y costo por llamada.
 - Fallback local ante 429, sin reintentar contra Gemini.
 - Cola durable como amortiguador: un pico de transferencias se convierte en backlog y no en carga simultánea.
@@ -213,7 +213,7 @@ ETL diario (Bancs + SmartBancs) -> datos anonimizados -> Feature store
 2. **Autoescalado por cola** (KEDA sobre la profundidad de `smartbancs.ai.queue`), con un mínimo y un máximo de réplicas. El máximo lo fija la cuota de Gemini y la capacidad del backend para recibir los POST, no solo la cola.
 3. **Cuota y costo de Gemini:**
    - *Token bucket* compartido (p. ej. en Redis) con el RPM contratado.
-   - Circuit breaker: tras N fallos o 429 seguidos, se usa directamente el fallback durante T segundos, lo que evita pagar el timeout de 10 s por evento.
+   - Circuit breaker: tras N fallos o 429 seguidos, se usa directamente el fallback durante T segundos, lo que evita pagar el timeout de Gemini por evento.
    - Presupuesto diario de tokens con alerta.
 4. **Priorización:** si hay backlog, se atienden primero los eventos recientes (una recomendación vieja pierde valor) o los de alto monto (posible fraude). Los eventos viejos se pueden procesar solo con el motor heurístico.
 5. **Caché** de perfiles de cliente y de respuestas para patrones repetidos (misma categoría y rango de monto), con TTL corto. Su beneficio se mide antes de adoptarla.

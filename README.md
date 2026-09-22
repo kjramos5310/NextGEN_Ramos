@@ -3,7 +3,7 @@
 Prueba técnica TCS NextGen Engineer. SmartBancs es un MVP de plataforma de transferencias bancarias en tiempo real con tres piezas principales:
 
 - **Transferencias ACID con concurrencia controlada.** Locks pesimistas en orden determinista, `lock_timeout`/`statement_timeout`, reintento ante deadlock, `Idempotency-Key` y montos exactos en `NUMERIC`.
-- **Recomendaciones financieras con IA que no bloquean la transferencia.** Los eventos se guardan en un *Transactional Outbox* dentro de la misma transacción y un relay los publica en RabbitMQ con *publisher confirms*. El `ai-service` los consume y usa Gemini (`gemini-2.5-flash`) o, sin API key o si Gemini falla, un motor heurístico local.
+- **Recomendaciones financieras con IA que no bloquean la transferencia.** Los eventos se guardan en un *Transactional Outbox* dentro de la misma transacción y un relay los publica en RabbitMQ con *publisher confirms*. El `ai-service` los consume y usa Gemini (`gemini-3.6-flash`) o, sin API key o si Gemini falla, un motor heurístico local.
 - **Integración con el core legado "Bancs"**: un evento `bancs.sync` por transferencia en una cola durable (el worker con rate limiting está diseñado, no implementado) y un pipeline ETL en Python que limpia un lote crudo del core.
 
 Además incluye observabilidad (logs con `x-correlation-id`, métricas Prometheus y un dashboard de Grafana) y una consola para simular el pico de quincena.
@@ -51,7 +51,7 @@ Las líneas discontinuas son opcionales o de diseño. Los diagramas completos es
 | Base de datos | PostgreSQL 16 | ACID, `SELECT ... FOR UPDATE`, `SKIP LOCKED` para el relay, `NUMERIC(18,2)` y `pg_stat_statements` para diagnosticar. |
 | Mensajería | RabbitMQ 3.13 | Colas durables, *publisher confirms*, ack manual y dead-letter exchange. Suficiente para el volumen del MVP sin operar Kafka. |
 | IA | Python 3.11 + FastAPI + pika | Servicio independiente del backend; si se cae, las transferencias siguen funcionando. |
-| Modelo | Gemini `gemini-2.5-flash` + motor heurístico | Gemini es opcional: sin API key, o si falla, el motor de reglas responde. El motor usado queda en `metadata.engine`. |
+| Modelo | Gemini `gemini-3.6-flash` + motor heurístico | Gemini es opcional: sin API key, o si falla, el motor de reglas responde. El motor usado queda en `metadata.engine`. |
 | ETL | Python + pandas | Limpieza y *feature engineering* de un lote tabular con nulos, duplicados y formatos mixtos. |
 | Frontend | React 18 + Vite + Tailwind, servido por nginx | SPA ligera para operar la demo: cuentas, transferencias, recomendaciones y consola de incidentes. |
 | Observabilidad | winston, prom-client, Prometheus, Grafana | Logs con correlation ID (JSON en producción), métricas por SQLSTATE y dashboard provisionado. |
@@ -77,7 +77,7 @@ cp .env.example .env
   ```
 
   El script hace una inferencia real con el código del servicio, dice si respondió Gemini o el motor heurístico y nunca imprime la clave.
-- `docker compose` lee de `.env` solo `GEMINI_API_KEY` y `GEMINI_MODEL` (por defecto `gemini-2.5-flash`). El resto de variables de `.env.example` documenta los valores que el compose ya fija en `docker-compose.yml`.
+- `docker compose` lee de `.env` solo `GEMINI_API_KEY` y `GEMINI_MODEL` (por defecto `gemini-3.6-flash`). El resto de variables de `.env.example` documenta los valores que el compose ya fija en `docker-compose.yml`.
 - En `docker-compose.yml` el backend arranca con `SIMULATION_ENABLED: "true"` para la demo, lo que habilita `/api/v1/simulation`. Esos endpoints mueven saldos reales; fuera de una demo deben quedar en `false`.
 - Las credenciales del compose (`postgrespassword`, `guest/guest`, `admin/admin`) son solo para uso local.
 
@@ -130,7 +130,7 @@ curl http://localhost:4000/api/v1/recommendations/account/1000000001
 curl -s http://localhost:4000/metrics | grep -E '^smartbancs_(transactions_total|db_errors_total|outbox_pending_events|db_pool_waiting_requests|ai_recommendation_duration_seconds_count)'
 ```
 
-La respuesta lleva el header `x-correlation-id`. Con ese valor puedes seguir la operación en `docker compose logs backend ai-service`. La recomendación guarda en `metadata.engine` qué motor la generó (`gemini-2.5-flash` o `heuristic-fallback`).
+La respuesta lleva el header `x-correlation-id`. Con ese valor puedes seguir la operación en `docker compose logs backend ai-service`. La recomendación guarda en `metadata.engine` qué motor la generó (`gemini-3.6-flash` o `heuristic-fallback`).
 
 En RabbitMQ Management (pestaña *Queues*) se ven `smartbancs.ai.queue`, su DLQ `smartbancs.ai.dlq` y `smartbancs.bancs.sync.queue`, que acumula mensajes porque no tiene consumidor.
 

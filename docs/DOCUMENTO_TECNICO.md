@@ -42,7 +42,7 @@ Las cifras de latencia o de TPS que aparecen son **objetivos** del enunciado o *
    pg_stat_statements, log_lock_waits                         |
               ^                                               v
               |                          ai-service (FastAPI + consumidor pika, :8000)
-              |                            Gemini (GEMINI_MODEL, por defecto gemini-2.5-flash)
+              |                            Gemini (GEMINI_MODEL, por defecto gemini-3.6-flash)
               |                            o motor heurístico local (fallback)
               +---- POST /api/v1/recommendations (idempotente por transaction_id) ----+
 
@@ -171,7 +171,7 @@ El detalle está en [IA_IMPLEMENTACION_Y_DESPLIEGUE.md](IA_IMPLEMENTACION_Y_DESP
   - Hace el POST al backend con hasta 3 intentos ante timeout, error de conexión o 5xx.
   - Ante 4xx, mensaje inválido o reintentos agotados: `basic_nack(requeue=False)` → DLQ `smartbancs.ai.dlq`.
 - **Inferencia** ([advisor.py](../ai-service/advisor.py)):
-  - Gemini (`GEMINI_MODEL`, por defecto `gemini-2.5-flash`) con `responseMimeType: application/json` y timeout de 10 s.
+  - Gemini (`GEMINI_MODEL`, por defecto `gemini-3.6-flash`) con `responseMimeType: application/json` y timeout de 15 s (`GEMINI_TIMEOUT_SECONDS`).
   - Valida la respuesta: `type` dentro del enum y `title` de hasta 150 caracteres.
   - Si no hay API key, o ante error, 429, timeout o respuesta inválida, usa el motor heurístico local.
 - **Persistencia idempotente:** `POST /api/v1/recommendations` deduplica por `transaction_id` (índice único `uq_ai_recs_transaction` + captura de `23505`).

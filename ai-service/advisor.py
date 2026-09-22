@@ -18,7 +18,15 @@ configure_logging()
 logger = logging.getLogger("AI-Advisor")
 
 # Timeout real de la llamada HTTP a Gemini (segundos). Los mensajes de log lo citan desde aquí.
-GEMINI_TIMEOUT_SECONDS = 10.0
+# La inferencia es asíncrona (fuera del camino crítico de la transferencia): se tolera más latencia
+GEMINI_TIMEOUT_SECONDS = float(os.getenv("GEMINI_TIMEOUT_SECONDS", "15"))
+
+# Umbrales del motor de reglas (fallback). Son parámetros de negocio explícitos, no aprendidos.
+HIGH_VALUE_THRESHOLD = 5000.0          # USD: monto que se trata como alerta de seguridad
+HIGH_SHARE_THRESHOLD = 0.30            # la transacción consume >= 30 % del saldo previo
+DISCRETIONARY_SHARE_THRESHOLD = 0.10   # gasto discrecional >= 10 % del saldo previo
+RULE_CONFIDENCE = 0.5                  # valor fijo para reglas: no es una probabilidad calibrada
+CATEGORY_ES = {"FOOD": "alimentación", "ENTERTAINMENT": "entretenimiento", "SHOPPING": "compras"}
 HEURISTIC_ENGINE = "heuristic-fallback"
 # Valores aceptados por el enum de PostgreSQL en ai_recommendations.type
 VALID_TYPES = {"SPENDING_ALERT", "BUDGET_OPTIMIZATION", "INVESTMENT_OPPORTUNITY", "SAVINGS_ADVICE", "FRAUD_WARNING"}
@@ -29,7 +37,7 @@ class FinancialAdvisorModel:
         self.model_version = "v2.5.0-gemini-hybrid"
         self.model_name = "SmartBancs-Gemini-Advisor"
         self.gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip()
-        self.gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        self.gemini_model = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
         self.total_inferences = 0
         self.gemini_success_count = 0
         self.fallback_count = 0
@@ -154,6 +162,12 @@ class FinancialAdvisorModel:
         try:
             started = time.time()
             response = requests.post(url, json=payload, headers=headers, timeout=GEMINI_TIMEOUT_SECONDS)
+            # thinkingConfig no es aceptado igual por todas las versiones de modelo: si la API lo rechaza,
+            # se reintenta una vez sin él en lugar de caer directo al motor heurístico
+            if response.status_code == 400 and "thinking" in response.text.lower():
+                logger.warning("[GEMINI-API] El modelo rechazó thinkingConfig; reintentando sin él.")
+                payload["generationConfig"].pop("thinkingConfig", None)
+                response = requests.post(url, json=payload, headers=headers, timeout=GEMINI_TIMEOUT_SECONDS)
             latency_ms = (time.time() - started) * 1000
             if response.status_code == 200:
                 resp_json = response.json()
@@ -176,7 +190,7 @@ class FinancialAdvisorModel:
             elif response.status_code == 429:
                 logger.warning(f"[GEMINI-API] Cuota excedida (HTTP 429 Rate Limit) en {latency_ms:.0f} ms. Aplicando fallback a reglas locales.")
             else:
-                logger.warning(f"[GEMINI-API] Error de API Gemini HTTP {response.status_code} en {latency_ms:.0f} ms: {response.text[:200]}. Aplicando fallback a reglas locales.")
+                logger.warning(f"[GEMINI-API] Error de API Gemini HTTP {response.status_code} en {latency_ms:.0f} ms: {response.text[:600]}. Aplicando fallback a reglas locales.")
         except requests.exceptions.Timeout:
             logger.warning(f"[GEMINI-API] Timeout en llamada a Gemini (> {GEMINI_TIMEOUT_SECONDS:.0f} s). Aplicando fallback a reglas locales.")
         except Exception as ex:
@@ -186,87 +200,62 @@ class FinancialAdvisorModel:
 
     def _heuristic_rule_fallback(self, tx_data: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Motor heurístico local (fallback resiliente).
-        Reglas deterministas sin llamadas de red; se usa cuando no hay API key
-        o cuando Gemini falla (timeout, error HTTP o respuesta inválida).
+        Motor heurístico local (fallback): reglas deterministas, sin red.
+        Se usa cuando no hay API key o cuando Gemini falla (timeout, error HTTP o respuesta inválida).
+
+        Solo afirma hechos calculados con los datos de la transacción (monto, categoría, saldo).
+        No inventa promedios, tasas ni metas. confidenceScore es un valor fijo para reglas:
+        no es una probabilidad calibrada. metadata.rule indica qué regla se aplicó.
         """
         amount = float(tx_data.get("amount", 0.0))
         category = str(tx_data.get("category", "TRANSFER")).upper()
-        current_balance = float(tx_data.get("currentBalance", 0.0))
-        account_number = str(tx_data.get("accountNumber", "UNKNOWN"))
-        tx_id = tx_data.get("transactionId")
+        balance_after = float(tx_data.get("currentBalance", 0.0))  # saldo tras el débito
+        balance_before = balance_after + amount
+        share = (amount / balance_before) if balance_before > 0 else 1.0
+        pct = share * 100
 
-        if category == "FOOD" and amount > 80.0:
+        def rec(rule: str, rtype: str, title: str, message: str, risk: str) -> Dict[str, Any]:
             return {
-                "accountNumber": account_number,
-                "transactionId": tx_id,
-                "type": "SPENDING_ALERT",
-                "title": "Alerta de Consumo en Alimentación",
-                "message": f"Tu gasto de ${amount:.2f} en alimentación supera el 15% del promedio recomendado para esta semana.",
-                "confidenceScore": 0.945,
+                "accountNumber": str(tx_data.get("accountNumber", "UNKNOWN")),
+                "transactionId": tx_data.get("transactionId"),
+                "type": rtype,
+                "title": title,
+                "message": message,
+                "confidenceScore": RULE_CONFIDENCE,
                 "engine": HEURISTIC_ENGINE,
-                "metadata": {"category": category, "amount": amount, "thresholdExceeded": True, "riskLevel": "MEDIUM"}
+                "metadata": {
+                    "rule": rule,
+                    "category": category,
+                    "amount": round(amount, 2),
+                    "shareOfBalance": round(share, 4),
+                    "riskLevel": risk,
+                },
             }
 
-        elif category == "ENTERTAINMENT" and amount > 100.0:
-            return {
-                "accountNumber": account_number,
-                "transactionId": tx_id,
-                "type": "BUDGET_OPTIMIZATION",
-                "title": "Optimización de Presupuesto en Entretenimiento",
-                "message": f"Consumo recreativo de ${amount:.2f} detectado. Mantener este gasto controlado te permitirá ahorrar hasta $150 al mes.",
-                "confidenceScore": 0.912,
-                "engine": HEURISTIC_ENGINE,
-                "metadata": {"category": category, "suggestedMonthlySaving": 150.0, "riskLevel": "LOW"}
-            }
+        # El orden importa: primero la regla de mayor riesgo
+        if amount >= HIGH_VALUE_THRESHOLD:
+            return rec("HIGH_VALUE", "FRAUD_WARNING", "Transacción de alto monto",
+                       f"Se registró una transferencia de ${amount:,.2f} ({pct:.0f}% de tu saldo previo). "
+                       "Si no reconoces esta operación, contacta al banco de inmediato.", "HIGH")
 
-        elif category == "SALARY" or amount >= 1500.0:
-            return {
-                "accountNumber": account_number,
-                "transactionId": tx_id,
-                "type": "INVESTMENT_OPPORTUNITY",
-                "title": "Oportunidad de Inversión Automatizada",
-                "message": f"Con el ingreso reciente de ${amount:.2f}, puedes rentabilizar tu liquidez en un fondo a plazo fijo SmartBancs con tasa 9.5% E.A.",
-                "confidenceScore": 0.978,
-                "engine": HEURISTIC_ENGINE,
-                "metadata": {"suggestedProduct": "CDT_DIGITAL", "projectedYield": "9.5% EA", "riskLevel": "LOW"}
-            }
+        if share >= HIGH_SHARE_THRESHOLD:
+            return rec("HIGH_SHARE_OF_BALANCE", "SPENDING_ALERT", "Gasto alto respecto a tu saldo",
+                       f"Esta transacción de ${amount:,.2f} representa el {pct:.0f}% de tu saldo previo. "
+                       f"Tu saldo disponible ahora es ${balance_after:,.2f}.", "MEDIUM")
 
-        elif current_balance > 5000.0 and amount < 50.0:
-            return {
-                "accountNumber": account_number,
-                "transactionId": tx_id,
-                "type": "SAVINGS_ADVICE",
-                "title": "Regla de Ahorro Automático Activada",
-                "message": f"Tu saldo actual es de ${current_balance:.2f}. Te sugerimos apartar el 10% en tu alcancía digital para emergencias.",
-                "confidenceScore": 0.962,
-                "engine": HEURISTIC_ENGINE,
-                "metadata": {"recommendedSavings": current_balance * 0.10, "riskLevel": "LOW"}
-            }
+        if category == "SALARY":
+            return rec("SALARY_RECEIVED", "INVESTMENT_OPPORTUNITY", "Movimiento de nómina",
+                       f"Se registró un movimiento de nómina de ${amount:,.2f}. "
+                       "Considera separar una parte para ahorro antes de planificar tus gastos.", "LOW")
 
-        elif amount > 5000.0:
-            return {
-                "accountNumber": account_number,
-                "transactionId": tx_id,
-                "type": "FRAUD_WARNING",
-                "title": "Monitoreo de Seguridad Transaccional",
-                "message": f"Transacción de alto monto (${amount:.2f}) procesada exitosamente. Si no reconoces esta operación, bloquea tu cuenta de inmediato.",
-                "confidenceScore": 0.991,
-                "engine": HEURISTIC_ENGINE,
-                "metadata": {"highValueFlag": True, "riskLevel": "HIGH"}
-            }
+        if category in ("FOOD", "ENTERTAINMENT", "SHOPPING") and share >= DISCRETIONARY_SHARE_THRESHOLD:
+            return rec("DISCRETIONARY_SPEND", "BUDGET_OPTIMIZATION", "Gasto discrecional relevante",
+                       f"Gasto de ${amount:,.2f} en {CATEGORY_ES.get(category, category.lower())}, el {pct:.0f}% de tu saldo previo. "
+                       "Revisa si está dentro de tu presupuesto del mes.", "LOW")
 
-        else:
-            return {
-                "accountNumber": account_number,
-                "transactionId": tx_id,
-                "type": "SAVINGS_ADVICE",
-                "title": "Finanzas Inteligentes SmartBancs",
-                "message": f"Transacción de ${amount:.2f} registrada correctamente. Continúas dentro de tu meta mensual de gastos.",
-                "confidenceScore": 0.885,
-                "engine": HEURISTIC_ENGINE,
-                "metadata": {"status": "ON_TRACK", "riskLevel": "LOW"}
-            }
+        return rec("DEFAULT", "SAVINGS_ADVICE", "Transacción registrada",
+                   f"Transacción de ${amount:,.2f} registrada ({pct:.1f}% de tu saldo previo). "
+                   f"Saldo disponible: ${balance_after:,.2f}.", "LOW")
 
     def analyze_transaction(self, tx_data: Dict[str, Any]) -> Dict[str, Any]:
         """
