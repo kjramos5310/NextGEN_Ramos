@@ -43,6 +43,11 @@ services:
     environment:
       RABBITMQ_DEFAULT_USER: guest
       RABBITMQ_DEFAULT_PASS: guest
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 10s
+      retries: 12
     networks:
       - smartbancs-network
 
@@ -72,10 +77,13 @@ services:
       OUTBOX_POLL_INTERVAL_MS: 500    # G1: frecuencia del relay del outbox
       OUTBOX_BATCH_SIZE: 100
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
-      AI_SERVICE_URL: http://ai-service:8000
+      # Demo: habilita /api/v1/simulation (pico de quincena y db-diagnostics). En producción: false.
+      SIMULATION_ENABLED: "true"
     depends_on:
-      - postgres
-      - rabbitmq
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
     networks:
       - smartbancs-network
 

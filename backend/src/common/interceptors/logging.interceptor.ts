@@ -24,6 +24,10 @@ export class LoggingInterceptor implements NestInterceptor {
     const correlationId = req.headers['x-correlation-id'] || 'N/A';
     const method = req.method;
     const url = req.originalUrl || req.url;
+    // Etiqueta de métrica con el patrón de ruta (/api/v1/transactions/:id), no la URL con IDs:
+    // evita una serie nueva por cada id (cardinalidad sin límite)
+    const route = req.route?.path ? `${req.baseUrl ?? ''}${req.route.path}` : 'unmatched';
+    const recordMetrics = route !== '/metrics';
     const startTime = Date.now();
 
     return next.handle().pipe(
@@ -32,12 +36,13 @@ export class LoggingInterceptor implements NestInterceptor {
           const duration = Date.now() - startTime;
           const statusCode = res.statusCode;
 
-          this.metricsService.recordHttpRequest(method, url, statusCode, duration / 1000);
+          if (recordMetrics) this.metricsService.recordHttpRequest(method, route, statusCode, duration / 1000);
 
           this.logger.log(`HTTP ${method} ${url} - Status: ${statusCode} - Latency: ${duration}ms`, {
             correlationId,
             method,
             url,
+            route,
             statusCode,
             durationMs: duration,
           });
@@ -46,7 +51,7 @@ export class LoggingInterceptor implements NestInterceptor {
           const duration = Date.now() - startTime;
           const statusCode = error.status || 500;
 
-          this.metricsService.recordHttpRequest(method, url, statusCode, duration / 1000);
+          if (recordMetrics) this.metricsService.recordHttpRequest(method, route, statusCode, duration / 1000);
 
           this.logger.error(
             `HTTP ${method} ${url} FAILED - Status: ${statusCode} - Latency: ${duration}ms - Error: ${error.message}`,

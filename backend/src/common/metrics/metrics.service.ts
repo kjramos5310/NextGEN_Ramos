@@ -70,14 +70,15 @@ export class MetricsService {
 
     this.aiRecommendationDurationSeconds = new client.Histogram({
       name: 'smartbancs_ai_recommendation_duration_seconds',
-      help: 'Latency of AI financial recommendation calculation in seconds',
-      buckets: [0.01, 0.05, 0.1, 0.2, 0.5, 1.0],
+      help: 'Latencia de inferencia de la IA reportada por ai-service (metadata.inferenceLatencyMs), en segundos',
+      labelNames: ['engine'],
+      buckets: [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10],
       registers: [this.registry],
     });
 
     this.dbErrorsCounter = new client.Counter({
       name: 'smartbancs_db_errors_total',
-      help: 'Errores de base de datos por SQLSTATE (57014 = statement_timeout, 55P03 = lock_timeout, 40P01 = deadlock)',
+      help: 'Errores de base de datos por SQLSTATE (57014 = statement_timeout, 55P03 = lock_timeout, 40P01 = deadlock, POOL_TIMEOUT = pool agotado)',
       labelNames: ['sqlstate'],
       registers: [this.registry],
     });
@@ -102,6 +103,7 @@ export class MetricsService {
     });
   }
 
+  /** route debe ser el patrón de la ruta (p. ej. /api/v1/transactions/:id), nunca la URL con IDs. */
   recordHttpRequest(method: string, route: string, statusCode: number, durationSeconds: number) {
     const cleanRoute = route.split('?')[0];
     this.httpRequestsTotal.inc({ method, route: cleanRoute, status_code: statusCode.toString() });
@@ -123,6 +125,10 @@ export class MetricsService {
     if (sqlstate === '40P01' || sqlstate === '55P03') {
       this.deadlocksDetectedCounter.inc({ sqlstate });
     }
+  }
+
+  recordAiRecommendationLatency(seconds: number, engine = 'unknown') {
+    this.aiRecommendationDurationSeconds.observe({ engine }, seconds);
   }
 
   recordTransactionRetry(sqlstate: string) {

@@ -54,7 +54,9 @@ import { SeedService } from './database/seeds/seed.service';
     RecommendationsModule,
     RabbitMQModule,
     MetricsModule,
-    SimulationModule,
+    // Endpoints de simulación/diagnóstico solo si se habilitan explícitamente (mueven saldos reales).
+    // ConfigModule.forRoot (arriba) ya cargó .env en process.env al evaluar esta línea.
+    ...(process.env.SIMULATION_ENABLED === 'true' ? [SimulationModule] : []),
     OutboxModule,
   ],
   providers: [

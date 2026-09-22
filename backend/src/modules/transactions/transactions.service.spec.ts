@@ -1,4 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
+import { ServiceUnavailableException, UnprocessableEntityException } from '@nestjs/common';
 import { TransactionsService } from './transactions.service';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { Transaction, TransactionCategory, TransactionStatus } from './entities/transaction.entity';
@@ -18,7 +19,10 @@ describe('TransactionsService - SLA, Outbox e idempotencia (unitario)', () => {
     commitTransaction: jest.fn().mockResolvedValue(null),
     rollbackTransaction: jest.fn().mockResolvedValue(null),
     release: jest.fn().mockResolvedValue(null),
-    query: jest.fn().mockResolvedValue(null),
+    // UPDATE accounts ... RETURNING balance: TypeORM devuelve [rows, rowCount]
+    query: jest.fn().mockImplementation(async (sql: string) =>
+      sql.includes('UPDATE accounts') ? [[{ balance: '4750.00' }], 1] : null,
+    ),
     isTransactionActive: true,
     manager: {
       insert: jest.fn().mockResolvedValue(null),
@@ -29,6 +33,7 @@ describe('TransactionsService - SLA, Outbox e idempotencia (unitario)', () => {
           accountNumber: '1000000001',
           accountHolder: 'Test User',
           balance: 5000.0,
+          currency: 'USD',
           status: AccountStatus.ACTIVE,
         })),
       }),
@@ -82,6 +87,7 @@ describe('TransactionsService - SLA, Outbox e idempotencia (unitario)', () => {
           accountNumber: params.num,
           accountHolder: `User ${params.num}`,
           balance: 5000.0,
+          currency: 'USD',
           status: AccountStatus.ACTIVE,
         }),
       })),
@@ -133,7 +139,13 @@ describe('TransactionsService - SLA, Outbox e idempotencia (unitario)', () => {
   });
 
   it('devuelve la transacción original ante una Idempotency-Key repetida sin tocar la BD', async () => {
-    const original = { id: 'tx-original', status: TransactionStatus.COMPLETED };
+    const original = {
+      id: 'tx-original',
+      status: TransactionStatus.COMPLETED,
+      sourceAccountNumber: '1000000001',
+      targetAccountNumber: '1000000002',
+      amount: 10,
+    };
     mockTxRepository.findOne.mockResolvedValueOnce(original);
     mockDataSource.createQueryRunner.mockClear();
 
@@ -145,5 +157,44 @@ describe('TransactionsService - SLA, Outbox e idempotencia (unitario)', () => {
 
     expect(result).toBe(original);
     expect(mockDataSource.createQueryRunner).not.toHaveBeenCalled();
+  });
+
+  it('responde 422 si la misma Idempotency-Key llega con otro monto o destino', async () => {
+    const original = {
+      id: 'tx-original',
+      sourceAccountNumber: '1000000001',
+      targetAccountNumber: '1000000002',
+      amount: 10,
+    };
+    mockTxRepository.findOne.mockResolvedValueOnce(original);
+    await expect(
+      service.processTransaction(
+        { sourceAccountNumber: '1000000001', targetAccountNumber: '1000000002', amount: 999 },
+        'CORR-IDEMP-2',
+        'key-123',
+      ),
+    ).rejects.toBeInstanceOf(UnprocessableEntityException);
+
+    mockTxRepository.findOne.mockResolvedValueOnce(original);
+    await expect(
+      service.processTransaction(
+        { sourceAccountNumber: '1000000001', targetAccountNumber: '1000000003', amount: 10 },
+        'CORR-IDEMP-3',
+        'key-123',
+      ),
+    ).rejects.toBeInstanceOf(UnprocessableEntityException);
+  });
+
+  it('pool agotado: responde 503 y cuenta POOL_TIMEOUT en smartbancs_db_errors_total', async () => {
+    mockMetricsService.recordDbError.mockClear();
+    mockQueryRunner.connect.mockRejectedValueOnce(new Error('timeout exceeded when trying to connect'));
+
+    await expect(
+      service.processTransaction(
+        { sourceAccountNumber: '1000000001', targetAccountNumber: '1000000002', amount: 10 },
+        'CORR-POOL',
+      ),
+    ).rejects.toBeInstanceOf(ServiceUnavailableException);
+    expect(mockMetricsService.recordDbError).toHaveBeenCalledWith('POOL_TIMEOUT');
   });
 });

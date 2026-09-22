@@ -1,9 +1,11 @@
 import {
   Injectable,
   BadRequestException,
+  HttpException,
   NotFoundException,
   InternalServerErrorException,
   ServiceUnavailableException,
+  UnprocessableEntityException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
@@ -29,6 +31,28 @@ const RETRYABLE = new Set<string>([PG.DEADLOCK_DETECTED, PG.SERIALIZATION_FAILUR
 
 export function pgErrorCode(error: any): string | undefined {
   return error?.code ?? error?.driverError?.code;
+}
+
+/** Etiqueta para smartbancs_db_errors_total cuando el error no trae SQLSTATE (pool agotado). */
+export const POOL_TIMEOUT = 'POOL_TIMEOUT';
+
+/** pg-pool lanza un Error sin SQLSTATE cuando vence connectionTimeoutMillis esperando una conexión libre. */
+export function isPoolTimeout(error: any): boolean {
+  const msg = String(error?.message ?? error?.driverError?.message ?? '');
+  return /timeout exceeded when trying to connect|connection terminated due to connection timeout/i.test(msg);
+}
+
+/** Monto en centavos enteros: evita comparar floats (0.1 + 0.2 !== 0.3). */
+export function toCents(value: number | string): number {
+  return Math.round(Number(value) * 100);
+}
+
+/** Representación exacta con 2 decimales para enviarla a PostgreSQL como NUMERIC. */
+export function toAmountString(value: number | string): string {
+  const cents = toCents(value);
+  const sign = cents < 0 ? '-' : '';
+  const abs = Math.abs(cents);
+  return `${sign}${Math.trunc(abs / 100)}.${String(abs % 100).padStart(2, '0')}`;
 }
 
 @Injectable()
@@ -62,26 +86,32 @@ export class TransactionsService {
       throw new BadRequestException('La cuenta de origen y destino no pueden ser iguales');
     }
 
-    // IDEMPOTENCIA (G2): si la clave ya fue procesada se devuelve el resultado original
-    if (idempotencyKey) {
-      const previous = await this.transactionRepository.findOne({ where: { idempotencyKey } });
-      if (previous) {
-        this.logger.log(`Idempotent replay: key ${idempotencyKey} -> tx ${previous.id}`, { correlationId, idempotencyKey });
-        return previous;
-      }
-    }
-
     for (let attempt = 1; ; attempt++) {
       try {
+        // IDEMPOTENCIA (G2): si la clave ya fue procesada se devuelve el resultado original.
+        // Va dentro del try: un timeout del pool aquí también responde 503 y suma en la métrica.
+        if (idempotencyKey && attempt === 1) {
+          const previous = await this.transactionRepository.findOne({ where: { idempotencyKey } });
+          if (previous) {
+            this.assertSameRequest(previous, dto, idempotencyKey);
+            this.logger.log(`Idempotent replay: key ${idempotencyKey} -> tx ${previous.id}`, { correlationId, idempotencyKey });
+            return previous;
+          }
+        }
         return await this.executeTransfer(dto, correlationId, idempotencyKey, startTime);
       } catch (error) {
         const sqlstate = pgErrorCode(error);
+        const poolTimeout = !sqlstate && isPoolTimeout(error);
         if (sqlstate) this.metricsService.recordDbError(sqlstate);
+        else if (poolTimeout) this.metricsService.recordDbError(POOL_TIMEOUT);
 
         // Dos peticiones concurrentes con la misma clave: gana una, la otra devuelve la ganadora
         if (sqlstate === PG.UNIQUE_VIOLATION && idempotencyKey) {
           const winner = await this.transactionRepository.findOne({ where: { idempotencyKey } });
-          if (winner) return winner;
+          if (winner) {
+            this.assertSameRequest(winner, dto, idempotencyKey);
+            return winner;
+          }
         }
 
         if (sqlstate && RETRYABLE.has(sqlstate) && attempt < this.maxAttempts) {
@@ -101,17 +131,34 @@ export class TransactionsService {
         );
         // Se registra SQLSTATE y la consulta exacta para diagnosticar el cuello de botella (R3.5a-c)
         this.logger.error(`Transaction processing failed: ${error.message}`, error.stack, {
-          correlationId, sourceAccountNumber, targetAccountNumber, amount, sqlstate, attempt,
+          correlationId, sourceAccountNumber, targetAccountNumber, amount,
+          sqlstate: sqlstate ?? (poolTimeout ? POOL_TIMEOUT : undefined), attempt,
           query: error?.query,
         });
 
-        if (error instanceof BadRequestException || error instanceof NotFoundException) throw error;
+        if (error instanceof HttpException) throw error;
+        if (poolTimeout) {
+          throw new ServiceUnavailableException('Pool de conexiones agotado (POOL_TIMEOUT). Reintente la operación.');
+        }
         if (sqlstate === PG.LOCK_NOT_AVAILABLE || sqlstate === PG.QUERY_CANCELED || (sqlstate && RETRYABLE.has(sqlstate))) {
           // Falla rápido: libera la conexión en vez de acumular espera durante el pico
           throw new ServiceUnavailableException(`Sistema bajo alta contención (SQLSTATE ${sqlstate}). Reintente la operación.`);
         }
         throw new InternalServerErrorException('Error en el procesamiento transaccional');
       }
+    }
+  }
+
+  /** Misma Idempotency-Key con otro origen, destino o monto: es otro pago, no un reintento (422). */
+  private assertSameRequest(previous: Transaction, dto: CreateTransactionDto, idempotencyKey: string) {
+    const same =
+      previous.sourceAccountNumber === dto.sourceAccountNumber &&
+      previous.targetAccountNumber === dto.targetAccountNumber &&
+      toCents(previous.amount) === toCents(dto.amount);
+    if (!same) {
+      throw new UnprocessableEntityException(
+        `La Idempotency-Key ${idempotencyKey} ya se usó con otro origen, destino o monto`,
+      );
     }
   }
 
@@ -165,23 +212,43 @@ export class TransactionsService {
         throw new BadRequestException(`La cuenta destino #${targetAccountNumber} no está activa (${targetAccount.status})`);
       }
 
-      const currentBalance = Number(sourceAccount.balance);
-      if (currentBalance < amount) {
+      const txCurrency = currency ?? sourceAccount.currency;
+      if (sourceAccount.currency !== targetAccount.currency || txCurrency !== sourceAccount.currency) {
         throw new BadRequestException(
-          `Fondos insuficientes en la cuenta #${sourceAccountNumber}. Saldo disponible: $${currentBalance.toFixed(2)}, Requerido: $${amount.toFixed(2)}`,
+          `Moneda no coincide: transferencia ${txCurrency}, origen ${sourceAccount.currency}, destino ${targetAccount.currency}`,
         );
       }
 
-      sourceAccount.balance = Number((currentBalance - amount).toFixed(2));
-      targetAccount.balance = Number((Number(targetAccount.balance) + amount).toFixed(2));
-      await queryRunner.manager.save(Account, [sourceAccount, targetAccount]);
+      // Aritmética en NUMERIC dentro de PostgreSQL (no en float de JS): débito y crédito son
+      // exactamente el mismo monto. El débito es condicional al saldo, así no hay que comparar floats.
+      const amountStr = toAmountString(amount);
+      const newSourceBalance = await this.applyDelta(
+        queryRunner,
+        `UPDATE accounts SET balance = balance - $1::numeric, version = version + 1, updated_at = now()
+          WHERE account_number = $2 AND balance >= $1::numeric
+          RETURNING balance::text AS balance`,
+        [amountStr, sourceAccountNumber],
+      );
+      if (newSourceBalance === null) {
+        throw new BadRequestException(
+          `Fondos insuficientes en la cuenta #${sourceAccountNumber}. Saldo disponible: $${toAmountString(sourceAccount.balance)}, Requerido: $${amountStr}`,
+        );
+      }
+      await this.applyDelta(
+        queryRunner,
+        `UPDATE accounts SET balance = balance + $1::numeric, version = version + 1, updated_at = now()
+          WHERE account_number = $2
+          RETURNING balance::text AS balance`,
+        [amountStr, targetAccountNumber],
+      );
+      sourceAccount.balance = Number(newSourceBalance);
 
       const createdTx = queryRunner.manager.create(Transaction, {
         correlationId,
         sourceAccountNumber,
         targetAccountNumber,
-        amount,
-        currency: currency || 'USD',
+        amount: Number(amountStr),
+        currency: txCurrency,
         description: description || 'Transferencia SmartBancs',
         category: category || TransactionCategory.TRANSFER,
         status: TransactionStatus.COMPLETED,
@@ -205,11 +272,20 @@ export class TransactionsService {
       // La respuesta sale apenas termina el COMMIT: la IA y Bancs se alimentan del outbox (RNF-2, RNF-3)
       return createdTx;
     } catch (error) {
-      if (queryRunner.isTransactionActive) await queryRunner.rollbackTransaction();
+      // Si la conexión murió, el ROLLBACK también falla: se conserva el error original
+      if (queryRunner.isTransactionActive) await queryRunner.rollbackTransaction().catch(() => undefined);
       throw error;
     } finally {
-      await queryRunner.release();
+      await queryRunner.release().catch(() => undefined);
     }
+  }
+
+  /** Ejecuta un UPDATE ... RETURNING balance y devuelve el saldo nuevo (texto NUMERIC) o null si no afectó filas. */
+  private async applyDelta(queryRunner: QueryRunner, sql: string, params: unknown[]): Promise<string | null> {
+    const result = await queryRunner.query(sql, params);
+    // TypeORM devuelve [rows, rowCount] para UPDATE
+    const rows = Array.isArray(result) && Array.isArray(result[0]) ? result[0] : result;
+    return Array.isArray(rows) && rows.length > 0 ? String(rows[0].balance) : null;
   }
 
   private buildOutboxEvents(tx: Transaction, sourceAccount: Account, correlationId: string): Partial<OutboxEvent>[] {

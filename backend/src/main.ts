@@ -1,7 +1,7 @@
 import { NestFactory } from '@nestjs/core';
-import { ValidationPipe } from '@nestjs/common';
 import { AppModule } from './app.module';
 import { CustomLoggerService } from './common/logger/logger.service';
+import { buildValidationPipe } from './common/validation';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule, {
@@ -14,19 +14,12 @@ async function bootstrap() {
   app.enableCors({
     origin: '*',
     methods: 'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS',
-    allowedHeaders: 'Content-Type, Accept, Authorization, x-correlation-id',
+    // Idempotency-Key: el frontend (:3000) lo envía en cada transferencia; sin él el preflight bloquea el POST
+    allowedHeaders: 'Content-Type, Accept, Authorization, x-correlation-id, Idempotency-Key',
+    exposedHeaders: 'x-correlation-id',
   });
 
-  app.useGlobalPipes(
-    new ValidationPipe({
-      whitelist: true,
-      transform: true,
-      forbidNonWhitelisted: true,
-      transformOptions: {
-        enableImplicitConversion: true,
-      },
-    }),
-  );
+  app.useGlobalPipes(buildValidationPipe());
 
   app.enableShutdownHooks();
 
