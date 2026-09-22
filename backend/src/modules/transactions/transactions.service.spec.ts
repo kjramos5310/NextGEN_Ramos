@@ -4,13 +4,13 @@ import { getRepositoryToken } from '@nestjs/typeorm';
 import { Transaction, TransactionCategory, TransactionStatus } from './entities/transaction.entity';
 import { Account, AccountStatus } from '../accounts/entities/account.entity';
 import { DataSource } from 'typeorm';
-import { RabbitMQService } from '../rabbitmq/rabbitmq.service';
+import { ConfigService } from '@nestjs/config';
+import { OutboxEvent } from '../outbox/entities/outbox-event.entity';
 import { MetricsService } from '../../common/metrics/metrics.service';
 import { CustomLoggerService } from '../../common/logger/logger.service';
 
-describe('TransactionsService - SLA & Async AI Decoupling Test', () => {
+describe('TransactionsService - SLA, Outbox e idempotencia (unitario)', () => {
   let service: TransactionsService;
-  let rabbitmqService: RabbitMQService;
 
   const mockQueryRunner: any = {
     connect: jest.fn().mockResolvedValue(null),
@@ -18,7 +18,10 @@ describe('TransactionsService - SLA & Async AI Decoupling Test', () => {
     commitTransaction: jest.fn().mockResolvedValue(null),
     rollbackTransaction: jest.fn().mockResolvedValue(null),
     release: jest.fn().mockResolvedValue(null),
+    query: jest.fn().mockResolvedValue(null),
+    isTransactionActive: true,
     manager: {
+      insert: jest.fn().mockResolvedValue(null),
       createQueryBuilder: jest.fn().mockReturnValue({
         setLock: jest.fn().mockReturnThis(),
         where: jest.fn().mockReturnThis(),
@@ -41,14 +44,13 @@ describe('TransactionsService - SLA & Async AI Decoupling Test', () => {
     createQueryRunner: jest.fn().mockReturnValue(mockQueryRunner),
   };
 
-  const mockRabbitMQService = {
-    publishEvent: jest.fn().mockResolvedValue(true),
-  };
-
   const mockMetricsService = {
     recordTransaction: jest.fn(),
-    recordDeadlock: jest.fn(),
+    recordDbError: jest.fn(),
+    recordTransactionRetry: jest.fn(),
   };
+
+  const mockTxRepository = { findOne: jest.fn().mockResolvedValue(null) };
 
   const mockLogger = {
     log: jest.fn(),
@@ -61,18 +63,17 @@ describe('TransactionsService - SLA & Async AI Decoupling Test', () => {
       providers: [
         TransactionsService,
         { provide: DataSource, useValue: mockDataSource },
-        { provide: getRepositoryToken(Transaction), useValue: {} },
-        { provide: RabbitMQService, useValue: mockRabbitMQService },
+        { provide: getRepositoryToken(Transaction), useValue: mockTxRepository },
+        { provide: ConfigService, useValue: { get: (_k: string, d: any) => d } },
         { provide: MetricsService, useValue: mockMetricsService },
         { provide: CustomLoggerService, useValue: mockLogger },
       ],
     }).compile();
 
     service = module.get<TransactionsService>(TransactionsService);
-    rabbitmqService = module.get<RabbitMQService>(RabbitMQService);
   });
 
-  it('debe procesar la transacción y despachar el evento de IA de forma asíncrona no bloqueante', async () => {
+  it('procesa la transferencia y escribe los eventos de IA y Bancs en el outbox dentro de la misma transacción', async () => {
     // Sobrescribir queryBuilder para simular cuenta origen y destino
     mockQueryRunner.manager.createQueryBuilder = jest.fn().mockImplementation((entity, alias) => ({
       setLock: jest.fn().mockReturnThis(),
@@ -109,15 +110,40 @@ describe('TransactionsService - SLA & Async AI Decoupling Test', () => {
     // Verificar que la respuesta es inmediata (muy por debajo de 2000 ms)
     expect(executionDuration).toBeLessThan(2000);
 
-    // Verificar que se emitió el evento a RabbitMQ para la IA sin bloquear la respuesta
-    expect(mockRabbitMQService.publishEvent).toHaveBeenCalledWith(
-      'transaction.created',
-      expect.objectContaining({
-        accountNumber: '1000000001',
-        amount: 250.0,
-        category: TransactionCategory.TRANSFER,
-      }),
-      'CORR-TEST-123',
+    // Timeouts por transacción (G3)
+    expect(mockQueryRunner.query).toHaveBeenCalledWith(expect.stringContaining('SET LOCAL lock_timeout'));
+    expect(mockQueryRunner.query).toHaveBeenCalledWith(expect.stringContaining('SET LOCAL statement_timeout'));
+
+    // Outbox (G1): los eventos se insertan en la misma transacción, ANTES del commit.
+    // La API ya no publica directamente en RabbitMQ.
+    expect(mockQueryRunner.manager.insert).toHaveBeenCalledWith(
+      OutboxEvent,
+      expect.arrayContaining([
+        expect.objectContaining({
+          eventType: 'transaction.created',
+          payload: expect.objectContaining({ accountNumber: '1000000001', amount: 250.0 }),
+          correlationId: 'CORR-TEST-123',
+        }),
+        expect.objectContaining({ eventType: 'bancs.sync' }),
+      ]),
     );
+    const insertOrder = mockQueryRunner.manager.insert.mock.invocationCallOrder[0];
+    const commitOrder = mockQueryRunner.commitTransaction.mock.invocationCallOrder[0];
+    expect(insertOrder).toBeLessThan(commitOrder);
+  });
+
+  it('devuelve la transacción original ante una Idempotency-Key repetida sin tocar la BD', async () => {
+    const original = { id: 'tx-original', status: TransactionStatus.COMPLETED };
+    mockTxRepository.findOne.mockResolvedValueOnce(original);
+    mockDataSource.createQueryRunner.mockClear();
+
+    const result = await service.processTransaction(
+      { sourceAccountNumber: '1000000001', targetAccountNumber: '1000000002', amount: 10 },
+      'CORR-IDEMP',
+      'key-123',
+    );
+
+    expect(result).toBe(original);
+    expect(mockDataSource.createQueryRunner).not.toHaveBeenCalled();
   });
 });
