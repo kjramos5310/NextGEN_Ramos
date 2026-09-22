@@ -15,7 +15,8 @@
 ## 🏛️ 1. Arquitectura de la Solución
 
 ```
-<img width="636" height="777" alt="image" src="https://github.com/user-attachments/assets/a2d47280-a1ba-42b9-a270-2856b02eb167" />
+![Diagrama de Arquitectura SmartBancs](./docs/Architecture.png)
+
 
 ```
 
