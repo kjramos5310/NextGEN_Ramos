@@ -20,13 +20,15 @@ Reto técnico "SmartBancs App": una plataforma de transacciones en tiempo real c
 Restricciones clave: picos de 10 000 TPS, transferencias < 2 s, la IA nunca bloquea el flujo transaccional y Bancs no tolera alto volumen de consultas directas.
 
 ## Proceso (fases)
-1. Base de conocimiento en Obsidian (`docs/knowledge-base/`) — **hecha en borrador**
-2. RAG local sobre la bóveda (`tools/kb-rag/`) — **implementada; falta generar la evidencia con e5 en la PC del autor**
-3. Retrieve + análisis de brechas + diseño del MVP (ADR en `03-Decisiones/`)
-4. Construcción del MVP a partir de las brechas
-5. Revisión con equipo de agentes + diagramas (Mermaid, Archify)
+La primera versión del MVP ya existía antes de la fase 1; las fases sirven para contrastarla contra referencias y corregirla.
 
-**No escribas código de la aplicación (backend, IA, ETL) hasta la fase 4.**
+1. Base de conocimiento en Obsidian (`docs/knowledge-base/`) — **hecha; notas en `borrador`**
+2. RAG local sobre la bóveda (`tools/kb-rag/`) — **hecha; evidencia con e5 en `04-Evidencias/retrieval-smoke-test.md`**
+3. Retrieve + análisis de brechas (`docs/ANALISIS_BRECHAS.md`) — **hecha; ADR en `03-Decisiones/` sin escribir**
+4. Corrección del MVP a partir de las brechas — **hecha (G5, G8 y G9 pendientes)**
+5. Revisión con equipo de agentes + diagramas (Mermaid, Archify) — **hecha: `docs/revision/`, `docs/ARQUITECTURA_DIAGRAMAS.md`**
+
+**No modifiques el código de la aplicación (backend, IA, ETL) fuera de las fases de corrección (4 y 5).**
 
 ## Estructura
 ```
@@ -38,7 +40,8 @@ docs/knowledge-base/                  bóveda Obsidian
   03-Decisiones/                      ADR (fase 3+)
   04-Evidencias/                      salidas de pruebas (retrieval, carga, etc.)
 tools/kb-rag/                         ingest.py, query.py, smoke_test.py, lint_vault.py
-docs/proceso/                         bitácora del proceso y prompts (OpenCode, fase 3)
+docs/proceso/                         bitácora del proceso
+docs/revision/                        informes de la segunda revisión
 ```
 
 ## Reglas para notas de la bóveda

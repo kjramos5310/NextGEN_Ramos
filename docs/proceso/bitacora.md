@@ -16,8 +16,26 @@ Registro de cómo se construyó cada entregable y con qué herramienta. Alimenta
 |---|---|---|
 | Diseño e implementación | Claude | `kbrag.py`, `ingest.py`, `query.py`, `smoke_test.py` |
 | Prueba del pipeline | Claude, backend `test-hashing` | 12 notas → 79 fragmentos (≤ 480 tokens). Valida chunking, metadatos, Chroma y consultas. **No es evidencia semántica** |
-| Evidencia con e5 | Pendiente: OpenCode en la PC del autor (prompt OC-1) | El entorno de Claude no tenía acceso a Hugging Face para descargar el modelo |
+| Evidencia con e5 | `tools/kb-rag/smoke_test.py` fuera del entorno de Claude | El entorno de Claude no tenía acceso a Hugging Face para descargar el modelo. Resultado en `04-Evidencias/retrieval-smoke-test.md`: backend `e5`, hit@5 = 37/41 (90 %) |
+
+## Fase 3: análisis de brechas
+| Paso | Herramienta | Detalle |
+|---|---|---|
+| Retrieve + comparación con el código | Claude Code + RAG local | `docs/ANALISIS_BRECHAS.md`: brechas G1–G10 con evidencia `archivo:línea` |
+
+## Fase 4: correcciones por brecha
+| Paso | Herramienta | Detalle |
+|---|---|---|
+| Implementación | Claude Code | Commits con el ID de la brecha (G1–G4, G6, G7, G10); estado en la sección 4 de `ANALISIS_BRECHAS.md` |
+| Validación | Candidato | Ejecución de pruebas y revisión de diffs |
+
+## Fase 5: segunda revisión con equipo de agentes
+| Paso | Herramienta | Detalle |
+|---|---|---|
+| Revisión | Claude Code, equipo de agentes | Roles de concurrencia/BD, SRE/observabilidad, coherencia docs-código y diagramador. Informes en `docs/revision/` |
+| Correcciones | Claude Code, validadas por el candidato | Commits `fix(review): correcciones del backend…`, `fix(ai-service): sin perdida de mensajes…`, `fix(frontend): la UI solo muestra datos reales`, más la actualización de la documentación |
+| Diagramas | Claude Code (diagramador) + mermaid-cli | `docs/ARQUITECTURA_DIAGRAMAS.md`, validados con `mmdc`; la sección "Entrada para Archify" alimenta Archify |
 
 ## Pendiente del autor
 - Leer y corregir cada nota → `estado: revisada`.
-- Ejecutar OC-1 para generar `04-Evidencias/retrieval-smoke-test.md` con e5.
+- Video demostrativo y material de presentación (E4, G9).

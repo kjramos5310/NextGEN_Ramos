@@ -1,247 +1,497 @@
-# SmartBancs App — Documento Técnico de Arquitectura, Operaciones e IA
+# SmartBancs App: documento técnico de arquitectura, operaciones e IA
 
-**Proyecto:** SmartBancs App (NextGen Engineering Solution)  
-**Dominio:** Banca Digital Transaccional de Alta Concurrencia, Observabilidad e IA  
-**Versión:** 1.0.0 (Producción MVP)
+**Proyecto:** SmartBancs App (reto técnico TCS NextGen)
+**Alcance:** MVP ejecutable con `docker compose` más el diseño para producción.
+**Versión:** 1.0 (MVP)
+
+**Convención de este documento.** Cada afirmación va marcada como una de estas dos cosas:
+
+- **Implementado:** existe en el repositorio. Se cita el archivo y la función.
+- **Diseño / propuesta:** es cómo se haría en producción. No está en el código del MVP.
+
+Las cifras de latencia o de TPS que aparecen son **objetivos** del enunciado o **techos calculados a partir de la configuración**. En el repositorio no hay resultados de pruebas de carga versionados. La sección 1.3 explica cómo medirlas.
 
 ---
 
-## 1. Arquitectura General y Decisiones Técnicas
+## 1. Arquitectura general y decisiones técnicas
 
-### 1.1. Diagrama de Arquitectura del Sistema
+### 1.1. Diagrama de componentes (MVP)
+
 ```
-+-----------------------------------------------------------------------------------+
-|                              CAPA DE CLIENTE                                     |
-|     [ React 18 + Vite Single Page Application ] (Dashboard & Banca Móvil)        |
-+------------------------------------------+----------------------------------------+
-                                           | HTTP REST (x-correlation-id) < 2s SLA
-                                           v
-+-----------------------------------------------------------------------------------+
-|                              CAPA DE SERVICIOS                                    |
-|   +---------------------------------------------------------------------------+   |
-|   |                  SmartBancs Backend Core (NestJS + TypeScript)            |   |
-|   |  - Módulo Transaccional (ACID + Pessimistic Locking ordenado)            |   |
-|   |  - Middleware de Correlación Distribuida (x-correlation-id)              |   |
-|   |  - Logging Interceptor & Métricas Prometheus (/metrics)                  |   |
-|   +-------------------+-----------------------------------+-------------------+   |
-+-----------------------|-----------------------------------|-----------------------+
-                        |                                   | Eventos Asíncronos
-       Transacción SQL  |                                   v (smartbancs.events)
-       SELECT FOR UPDATE|                  +------------------------------------+
-                        v                  |      RabbitMQ Message Broker       |
-+---------------------------------------+  |   - smartbancs.ai.queue            |
-|       PostgreSQL 16 (ACID DB)         |  |   - smartbancs.bancs.sync.queue    |
-| - Cuentas Bancarias (accounts)        |  +-----------------+------------------+
-| - Transacciones (transactions)        |                    |
-| - Recomendaciones (ai_recommendations)|                    | Consumo Asíncrono
-+---------------------------------------+                    v
-                                           +------------------------------------+
-                                           |  AI Advisor Microservice (FastAPI) |
-                                           |  - Motor de Scoring Financiero     |
-                                           |  - MLOps Telemetría & Data Drift   |
-                                           +------------------------------------+
+ React 18 + Vite (frontend, :3000)
+        | HTTP REST  (x-correlation-id, Idempotency-Key)
+        v
+ +--------------------------- Backend NestJS (:4000) ----------------------------+
+ |  POST /api/v1/transactions                                                     |
+ |   1 transacción READ COMMITTED:                                                |
+ |     SET LOCAL lock_timeout / statement_timeout                                 |
+ |     SELECT ... FOR UPDATE (cuentas en orden determinista)                      |
+ |     UPDATE saldos (aritmética NUMERIC en SQL) + INSERT transactions            |
+ |     INSERT outbox_events (transaction.created, bancs.sync)  -> COMMIT -> 201   |
+ |                                                                                |
+ |  OutboxRelayService (en segundo plano, cada 500 ms)                            |
+ |     SELECT ... FOR UPDATE SKIP LOCKED -> publish (publisher confirms)          |
+ |     -> UPDATE published_at solo de los mensajes confirmados                    |
+ |  GET /metrics (prom-client)                                                    |
+ +------------+-----------------------------------------------+-------------------+
+              |                                               |
+              v                                               v
+   PostgreSQL 16 (:5432)                          RabbitMQ 3.13 (exchange topic smartbancs.events)
+   accounts, transactions,                          - smartbancs.ai.queue  (DLX smartbancs.dlx -> smartbancs.ai.dlq)
+   ai_recommendations, outbox_events                - smartbancs.bancs.sync.queue (sin consumidor en el MVP)
+   pg_stat_statements, log_lock_waits                         |
+              ^                                               v
+              |                          ai-service (FastAPI + consumidor pika, :8000)
+              |                            Gemini (GEMINI_MODEL, por defecto gemini-2.5-flash)
+              |                            o motor heurístico local (fallback)
+              +---- POST /api/v1/recommendations (idempotente por transaction_id) ----+
+
+ Prometheus (:9090) scrapea backend:4000/metrics  ->  Grafana (:3001)
+ ETL (etl-bancs/etl_bancs_processor.py): CSV crudo -> bancs_cleaned_features.json (no escribe en la BD)
 ```
 
-### 1.2. Justificación del Stack Tecnológico
+El diagrama de secuencia del flujo asíncrono de la IA está en [IA_IMPLEMENTACION_Y_DESPLIEGUE.md](IA_IMPLEMENTACION_Y_DESPLIEGUE.md); el resto de diagramas, en [ARQUITECTURA_DIAGRAMAS.md](ARQUITECTURA_DIAGRAMAS.md).
 
-| Componente | Elección | Justificación Técnica |
-| :--- | :--- | :--- |
-| **Backend Core** | **NestJS (Node.js/TypeScript)** | Proporciona tipado estricto para montos y entidades bancarias, arquitectura modular (Clean Architecture), inyección de dependencias y un Event Loop no-bloqueante capaz de sostener miles de peticiones simultáneas con baja latencia. |
-| **Base de Datos** | **PostgreSQL 16** | Garantías transaccionales **ACID**. Soporte nativo para bloqueos a nivel de fila (*Row-Level Locks*) con `SELECT ... FOR UPDATE`, índices B-Tree optimizados y aislamiento transaccional `READ COMMITTED` / `SERIALIZABLE`. |
-| **Broker de Mensajería** | **RabbitMQ** | Desacopla la invocación de IA y la sincronización con el core legado Bancs. Asegura que la API responda en **< 20 ms**, protegiendo el SLA de < 2 segundos mediante colas durables y buffers controlados. |
-| **Microservicio IA** | **Python (FastAPI)** | Estándar de la industria para Inteligencia Artificial y Machine Learning. Consume eventos en segundo plano sin competir por memoria o CPU con el motor transaccional. |
-| **Observabilidad** | **Prometheus + Grafana + Pino/Winston** | Trazabilidad distribuida extremo a extremo con `x-correlation-id`, histogramas de latencia (p50, p95, p99) y métricas de saturación del pool de conexiones para diagnóstico en tiempo real. |
+### 1.2. Justificación del stack (rendimiento, seguridad, escalabilidad)
+
+| Componente | Elección | Rendimiento | Seguridad | Escalabilidad |
+| :--- | :--- | :--- | :--- | :--- |
+| Backend | NestJS 10 + TypeScript | El event loop no bloqueante encaja con un trabajo por petición que es sobre todo E/S (BD); no hace cómputo pesado. | Tipado estricto y validación declarativa de DTOs (`class-validator`, `whitelist` + `forbidNonWhitelisted`, en [validation.ts](../backend/src/common/validation.ts)). | El servicio es *stateless*: se escala con réplicas detrás de un balanceador. El relay del outbox es seguro con varias réplicas gracias a `SKIP LOCKED`. |
+| Base de datos | PostgreSQL 16 | Locks de fila (`SELECT ... FOR UPDATE`), `NUMERIC(18,2)` para montos e índices B-Tree y parciales. | `CHECK (balance >= 0)` y `CHECK (amount > 0)` en [schema.sql](../backend/sql/schema.sql) como red de seguridad ante bugs de aplicación. | Escala vertical y réplicas de lectura. Para 10k TPS: PgBouncer y particionado (ver 1.3, diseño). |
+| Mensajería | RabbitMQ 3.13 | Saca la IA y Bancs del camino crítico de la transferencia. | Colas durables, mensajes persistentes y *publisher confirms*. | Consumidores competitivos por cola; DLQ para mensajes que no se pueden procesar. |
+| IA | Python 3.11 + FastAPI + pika | Proceso y contenedor separados: la inferencia no compite por el event loop del backend. | La API key de Gemini se lee de una variable de entorno y viaja en el header `x-goog-api-key`, no en la URL ([advisor.py](../ai-service/advisor.py)). | Réplicas del consumidor sobre la misma cola (diseño de autoescalado en el documento de IA). |
+| Observabilidad | Winston + prom-client + Prometheus + Grafana | Métricas agregadas de bajo costo. Los logs son JSON en `NODE_ENV=production`. | El correlation ID del cliente se valida (`^[A-Za-z0-9._:-]{1,64}$`) antes de usarse ([correlation-id.middleware.ts](../backend/src/common/middleware/correlation-id.middleware.ts)). | Prometheus federable; los logs JSON se pueden enviar a Loki o ELK (diseño). |
+| IaC | Docker Compose | Un solo comando levanta 7 servicios. Healthchecks en PostgreSQL y RabbitMQ; el backend espera a que ambos estén sanos. | Solo para uso local: credenciales de ejemplo en texto plano. | En producción: Kubernetes + HPA/KEDA (diseño). |
+
+### 1.3. Estrategia para 10.000 TPS (diseño) y qué valida el MVP
+
+El MVP **no demuestra** 10.000 TPS: corre en un solo host con un pool de 30 conexiones (`DB_POOL_MAX=30` en [docker-compose.yml](../docker-compose.yml)). Lo que sigue es el diseño para llegar a esa cifra y los límites que tiene.
+
+**Diseño para producción (no implementado):**
+
+1. **Réplicas stateless del backend** detrás de un balanceador, con autoescalado por CPU y latencia. Se escala la API solo si el cuello de botella no es la BD: más réplicas × pool por réplica puede agotar `max_connections` de PostgreSQL.
+2. **PgBouncer en modo `transaction`** entre las réplicas y PostgreSQL. Así se tienen miles de conexiones lógicas sobre un pool físico pequeño. El código es compatible: los timeouts se fijan con `SET LOCAL`, que vive dentro de la transacción ([transactions.service.ts](../backend/src/modules/transactions/transactions.service.ts), `executeTransfer`), y no se usan `SET` de sesión.
+3. **Particionado o *sharding* por número de cuenta.** Cada shard atiende una fracción de las cuentas. Las transferencias entre shards requieren una saga (débito, crédito y compensación) o 2PC. Es el principal *trade-off* del diseño y queda fuera del MVP.
+4. **Cuentas calientes.** Una cuenta pagadora de nómina serializa todas las transferencias que la tocan, porque cada una toma su lock de fila. El techo por cuenta es aproximadamente `1 / (tiempo que se retiene el lock)`. Se mitiga con subcuentas de dispersión, con el procesamiento de la nómina como lote en el core, o sacando la cuenta pagadora del camino síncrono.
+5. **Relay por CDC.** El relay por sondeo del MVP se reemplaza por Debezium (Outbox Event Router) leyendo el WAL. Con dos eventos por transferencia, 10k TPS son unos 20k eventos/s. El relay por sondeo tiene un techo configurado de 10 lotes × 100 eventos por tick de 500 ms (`MAX_BATCHES_PER_TICK` en [outbox-relay.service.ts](../backend/src/modules/outbox/outbox-relay.service.ts)); el techo real es menor porque cada lote espera las confirmaciones del broker y no está medido.
+6. **Colas como amortiguador**: IA y Bancs consumen a su propio ritmo, y la transferencia no espera a ninguno.
+7. **Control de admisión** en el API Gateway: rate limit por cliente y `429`/`503` con `Retry-After` antes de saturar la BD.
+
+**Qué valida el MVP (implementado y probado):**
+
+- Corrección bajo concurrencia. [concurrency.int-spec.ts](../backend/test/concurrency.int-spec.ts) tiene 12 pruebas contra PostgreSQL real (`npm run test:int`), entre ellas: 400 transferencias cruzadas en paralelo conservan el total; 50 débitos simultáneos de $10 sobre $100 aprueban exactamente 10; 300 transferencias de 0.01/0.10/0.20 conservan el total al centavo; idempotencia con 20 reintentos concurrentes; pool agotado → `503` + `POOL_TIMEOUT`.
+- Falla rápida: `lock_timeout`, `statement_timeout` y timeout de pool → `503`, en vez de dejar la conexión retenida.
+- Semántica del outbox: los eventos no confirmados siguen pendientes. Se prueba con un broker simulado (stub), no con un RabbitMQ real. La semántica de ack, nack y timeout de los *publisher confirms* se prueba con un canal simulado en [rabbitmq.service.spec.ts](../backend/src/modules/rabbitmq/rabbitmq.service.spec.ts).
+
+**Qué no valida el MVP:** el throughput (TPS), el p95 bajo carga sostenida, el failover de un broker real, CDC, PgBouncer ni el sharding.
+
+**Cómo medirlo:**
+
+- Endpoint de simulación `POST /api/v1/simulation/quincena-spike` (tope de 500 operaciones, `concurrentWorkers` ≤ 100; [simulation.service.ts](../backend/src/modules/simulation/simulation.service.ts)). Devuelve p95, promedio y errores.
+- Métrica `smartbancs_transaction_duration_seconds` en Prometheus.
+- Para el objetivo de 10k TPS hace falta una herramienta externa (k6, Gatling) contra un entorno de staging dimensionado.
+
+### 1.4. Seguridad: estado del MVP y diseño
+
+**Implementado:**
+
+- Validación de entrada: montos con máximo 2 decimales, entre 0.01 y 1.000.000; moneda `USD`; longitudes máximas ([create-transaction.dto.ts](../backend/src/modules/transactions/dto/create-transaction.dto.ts)).
+- `Idempotency-Key` de hasta 64 caracteres. Si llega la misma clave con otro payload, responde `422`.
+- Correlation ID validado.
+- La API key de Gemini va en un header y no se imprime (`check_gemini.py` solo muestra su longitud).
+- Los endpoints de simulación solo se registran con `SIMULATION_ENABLED=true` ([app.module.ts](../backend/src/app.module.ts)).
+
+**No implementado (limitaciones conocidas):**
+
+- No hay autenticación ni autorización.
+- CORS con `origin: '*'` ([main.ts](../backend/src/main.ts)).
+- Credenciales de ejemplo en `docker-compose.yml`.
+- `SIMULATION_ENABLED` está en `"true"` en compose para la demo.
+- `POST /api/v1/recommendations` (lo usa el ai-service) no tiene DTO de validación ni autenticación.
+
+**Diseño para producción:**
+
+- OAuth2/OIDC con JWT en el gateway y autorización por dueño de cuenta.
+- mTLS o red privada entre servicios; el endpoint de recomendaciones solo accesible para el ai-service.
+- Secretos en un gestor (Vault o Secret Manager).
+- CORS restringido al dominio del frontend.
+- Simulación deshabilitada en producción.
 
 ---
 
-## 2. Integración con el Core Legado "Bancs" y Manejo de Datos
+## 2. Integración con el core legado Bancs y manejo de datos
 
-### 2.1. Estrategia de Sincronización sin Saturar el Core Legado
-El Core Bancario Legado (*Bancs*) presenta restricciones de concurrencia y no soporta consultas masivas. Para resolver esto:
+### 2.1. Flujo de datos SmartBancs → Bancs sin saturar el core
 
-1. **Patrón Transactional Outbox (Salida) — implementado:**  
-   La transferencia escribe, **en la misma transacción ACID**, el débito/crédito, el registro en `transactions` y dos filas en `outbox_events` (`transaction.created` para la IA y `bancs.sync` para Bancs). Un relay (`outbox/outbox-relay.service.ts`) lee las filas pendientes con `SELECT ... FOR UPDATE SKIP LOCKED` y las publica en RabbitMQ; solo las marca como publicadas si el broker las aceptó. Así se evita el *dual-write*: si la transacción hace rollback el evento no existe, y si RabbitMQ está caído el evento espera en la tabla en lugar de perderse. La entrega es *at-least-once*, por lo que cada mensaje lleva `eventId` y los consumidores son idempotentes. En producción el relay por sondeo se reemplazaría por CDC sobre el WAL (Debezium Outbox Event Router).  
-   **Consumo hacia Bancs (diseño):** un worker dedicado sobre `smartbancs.bancs.sync.queue` con **Token Bucket Rate Limiting** despacharía las actualizaciones al Core Bancs en micro-lotes, protegiendo al legado de los picos. En el MVP la cola se alimenta desde el outbox; el worker de Bancs queda como siguiente paso.
-2. **Change Data Capture - CDC (Entrada):**  
-   Para sincronizar movimientos originados directamente en el Core Legado (cajeros físicos o cheques), se implementa un conector CDC (ej. Debezium / Kafka Connect) que lee los logs de transacciones del motor de Bancs sin ejecutar `SELECT` sobre tablas productivas.
+1. **Transactional Outbox (implementado).** La transferencia escribe en una sola transacción ACID el débito, el crédito, la fila de `transactions` y dos filas en `outbox_events` (`transaction.created` para la IA y `bancs.sync` para Bancs) (`TransactionsService.executeTransfer` y `buildOutboxEvents`). Si hay rollback, los eventos no existen. Si RabbitMQ está caído, esperan en la tabla. No hay *dual-write* en la petición HTTP.
 
-### 2.2. Pipeline ETL/ELT (`etl_bancs_processor.py`)
-El script implementado en Python procesa lotes crudos de transacciones legadas (`bancs_raw_transactions.csv`):
-- **Limpieza de Nulos y Datos Corruptos:** Descarta registros huérfanos sin cuenta origen y transacciones con montos no numéricos (`NaN`).
-- **Desduplicación:** Elimina transacciones repetidas por `TX_ID`.
-- **Estandarización:** Normaliza monedas (`USD`), estandariza fechas heterogéneas al formato ISO-8601 UTC y homologa códigos de operación legados a categorías de dominio bancario (`TRANSFER`, `SHOPPING`, `FOOD_ENTERTAINMENT`).
-- **Feature Engineering para IA:** Genera atributos predictivos (`logAmount`, `channelRiskScore`, `isHighValue`) exportando un dataset limpio en formato JSON (`bancs_cleaned_features.json`).
+2. **Relay con *publisher confirms* (implementado).** `OutboxRelayService.flushBatch` hace lo siguiente:
+   - Lee hasta 100 pendientes con `SELECT ... FOR UPDATE SKIP LOCKED`.
+   - Los publica por un `ConfirmChannel` (`RabbitMQService.publishEvent` resuelve `true` solo con el ack del broker, y `false` ante nack, error, timeout de 5 s o falta de conexión).
+   - Marca `published_at` solo en los confirmados, con un `UPDATE ... WHERE id = ANY($1)`. A los no confirmados les suma `attempts` y les guarda `last_error`.
 
----
+   `drain` repite lotes mientras estén llenos, con un máximo de 10 por tick. La conexión a RabbitMQ se reintenta sin límite, con backoff exponencial y tope de 30 s, también tras un `close` de la conexión o del canal ([rabbitmq.service.ts](../backend/src/modules/rabbitmq/rabbitmq.service.ts)). La entrega es *at-least-once*: cada mensaje lleva `eventId` (en el body y como `messageId`) y los consumidores deben ser idempotentes.
 
-## 3. Inteligencia Artificial: Implementación, Despliegue y MLOps
+3. **Cola durable hacia Bancs (implementado)** `smartbancs.bancs.sync.queue`. **En el MVP no tiene consumidor**, ni `x-max-length` ni TTL: los mensajes se acumulan.
 
-### 3.1. Arquitectura Híbrida de Inferencia (Google Gemini API + Motor Local)
-El microservicio `ai-service` opera bajo una arquitectura de alta resiliencia diseñada para entornos de misión crítica bancaria:
-1. **Motor Primario (Google Gemini API):**  
-   Si se configura la variable de entorno `GEMINI_API_KEY`, el servicio consume el endpoint de inferencia de Google Gemini (`gemini-1.5-flash` / `gemini-2.0-flash`) forzando salidas en JSON estructurado (`responseMimeType: "application/json"`).
-2. **Parser Resiliente de Doble Capa (*Self-Healing JSON*):**  
-   Para evitar caídas por delimitadores de texto o formateo no determinista del LLM:
-   - *Capa 1:* Sanitización y remoción de bloques markdown (\`\`\`json ... \`\`\`).
-   - *Capa 2 (Fallback regex):* Si el parseo estándar falla, una expresión regular aísla el primer objeto JSON `{ ... }` balanceado del texto crudo, recuperando el payload sin error.
-3. **Motor Secundario de Fallback Heurístico (Zero-Downtime):**  
-   Si no se proporciona una API Key, o ante errores de red, timeouts (>4.5s) o límites de cuota (HTTP 429), el servicio conmuta automáticamente a un motor de reglas financieras locales. Esto garantiza que el procesamiento transaccional continúe al 100% de disponibilidad.
+4. **Worker de Bancs con rate limiting (diseño).** Un consumidor dedicado con *token bucket* aplicaría las actualizaciones al core en micro-lotes, a un ritmo acordado con el equipo de Bancs (por ejemplo, N operaciones/s configurables). Tendría reintentos con backoff, DLQ propia y una política `max-length` + `reject-publish` para acotar la cola. Bancs nunca recibe el pico directo: recibe un flujo constante.
 
-### 3.2. Desacoplamiento Asíncrono (Garantía de SLA < 2 Segundos)
-El cálculo de recomendaciones de IA no se realiza dentro del ciclo de vida de la petición HTTP del usuario:
-- El endpoint `POST /api/v1/transactions` procesa el débito/crédito en base de datos (~15 ms), emite un evento a RabbitMQ (`smartbancs.ai.queue`) y retorna inmediatamente el código `201 Created` con el ID de transacción y el `correlation_id`.
-- El worker de IA en Python (`consumer.py`) consume el mensaje de la cola de manera asíncrona, evalúa la transacción con Gemini (o el motor de fallback) y persiste la recomendación en la tabla `ai_recommendations` mediante llamadas al endpoint `/api/v1/recommendations`.
+5. **Lecturas de saldo sin consultar Bancs (diseño).** SmartBancs mantiene su propio libro de saldos (tabla `accounts`) como fuente para la app. Bancs sigue siendo el sistema de registro y se concilia en diferido.
 
-### 3.3. Ciclo de Vida del Modelo en Producción (MLOps)
-1. **In-Context Learning & Feature Store:** El modelo se alimenta dinámicamente con perfiles de cliente y el dataset limpio generado por el pipeline ETL (`bancs_cleaned_features.json`).
-2. **Monitoreo de Data Drift:** Se evalúa la distribución de montos y categorías entrantes utilizando la métrica *Population Stability Index (PSI)*. Desviaciones con `confidenceScore < 0.50` desvían la operación a revisión manual.
-3. **Gestión de Recursos y Cuotas:** Despliegue en contenedor independiente con límites de memoria y CPU, aislamiento de hilos de ejecución y control de cuotas RPM para no saturar la API Key de Gemini.
+6. **CDC desde Bancs hacia SmartBancs (diseño).** Los movimientos originados en el core (cajeros, cheques, ventanilla) se capturarían con un conector CDC sobre el log de transacciones de Bancs (Debezium o el mecanismo que exponga el legado). Así no se ejecutan `SELECT` masivos sobre tablas productivas. Además, un job de conciliación nocturno compararía los saldos de ambos lados.
+
+### 2.2. Pipeline ETL (implementado: [etl_bancs_processor.py](../etl-bancs/etl_bancs_processor.py))
+
+Procesa [bancs_raw_transactions.csv](../etl-bancs/bancs_raw_transactions.csv) (12 registros) y produce [bancs_cleaned_features.json](../etl-bancs/bancs_cleaned_features.json) (9 válidos):
+
+- **Desduplicación** por `TX_ID`.
+- **Nulos y corruptos:**
+  - Descarta montos nulos o no numéricos (quita `$` y `,` antes de convertir).
+  - Descarta registros sin cuenta origen.
+  - Imputa la moneda nula como `USD` y la nota nula como `"Transaccion sin descripcion"`.
+- **Estandarización:**
+  - Fechas en 5 formatos → ISO-8601 con sufijo `Z`. No convierte zonas horarias: asume que la entrada ya está en UTC.
+  - Moneda en mayúsculas.
+  - Códigos legados → categorías (`TRANSFER`, `SHOPPING`, `FOOD_ENTERTAINMENT`, `UNKNOWN`, `OTHER`). Estas categorías son propias del dataset y no coinciden 1:1 con el enum del backend.
+- **Features para IA:** `isHighValue` (≥ 1000), `logAmount` (`log1p`) y `channelRiskScore` (por canal; 0.50 si el canal es desconocido).
+- **Límites:**
+  - La salida es un JSON y no se carga en la BD.
+  - El ai-service no la consume.
+  - No anonimiza los números de cuenta (en producción se aplicaría un hash, ver el documento de IA).
 
 ---
 
-## 4. Observabilidad y Trazabilidad Distribuida
+## 3. Inteligencia artificial (resumen)
 
-### 4.1. Instrumentación Implementada (Práctico)
-- **Logs Estructurados (JSON):** Cada log contiene timestamp ISO, nivel, servicio emisor, duración en ms y el `correlationId` para trazabilidad unificada. Implementado en `common/logger/logger.service.ts` con Winston.
-- **Métricas Prometheus (`/metrics`):** Implementadas en `common/metrics/metrics.service.ts` con `prom-client`:
-  - `smartbancs_transactions_total`: Contador de transacciones agrupadas por estado (`COMPLETED`, `FAILED`) y categoría.
-  - `smartbancs_transaction_duration_seconds`: Histograma de latencia transaccional (buckets: 5ms, 10ms, 20ms, 50ms, 100ms, 500ms, 1s, 2s).
-  - `smartbancs_deadlocks_detected_total{sqlstate}`: Deadlocks (`40P01`) y lock timeouts (`55P03`), clasificados por SQLSTATE.
-  - `smartbancs_db_errors_total{sqlstate}`: Todos los errores de BD por SQLSTATE (p. ej. `57014` = `statement_timeout`).
-  - `smartbancs_transaction_retries_total{sqlstate}`: Reintentos automáticos ante conflictos de concurrencia.
-  - `smartbancs_db_active_connections` / `smartbancs_db_pool_waiting_requests`: Conexiones en uso y peticiones esperando conexión en el pool (leídas del pool de `pg` en cada scrape).
-  - `smartbancs_outbox_pending_events`: Backlog de eventos aún no publicados hacia IA y Bancs.
-  - `http_requests_total` / `http_request_duration_seconds`: Tráfico HTTP general por método, ruta y código de estado.
-- **Trazabilidad Distribuida:** Middleware `correlation-id.middleware.ts` inyecta automáticamente un UUID `x-correlation-id` en cada petición HTTP. Este ID se propaga a los logs del backend, a los mensajes publicados en RabbitMQ y al microservicio de IA, permitiendo reconstruir la trazabilidad completa de una transacción a través de todos los componentes.
-- **Interceptor de Auditoría:** `logging.interceptor.ts` registra método HTTP, URL, código de estado, duración y correlationId de cada petición, además de alimentar los contadores de Prometheus.
+El detalle está en [IA_IMPLEMENTACION_Y_DESPLIEGUE.md](IA_IMPLEMENTACION_Y_DESPLIEGUE.md). Resumen de lo implementado:
 
-### 4.2. Diseño de Observabilidad (Teórico)
+- **Fuera del camino crítico.** `TransactionsService` no depende de RabbitMQ ni de la IA: su constructor solo recibe `DataSource`, el repositorio, métricas, logger y configuración. La transferencia responde `201` tras el `COMMIT`. El evento `transaction.created` sale del outbox por el relay.
+- **Consumidor** ([consumer.py](../ai-service/consumer.py)):
+  - `prefetch_count=5` y ack manual.
+  - Hace el POST al backend con hasta 3 intentos ante timeout, error de conexión o 5xx.
+  - Ante 4xx, mensaje inválido o reintentos agotados: `basic_nack(requeue=False)` → DLQ `smartbancs.ai.dlq`.
+- **Inferencia** ([advisor.py](../ai-service/advisor.py)):
+  - Gemini (`GEMINI_MODEL`, por defecto `gemini-2.5-flash`) con `responseMimeType: application/json` y timeout de 10 s.
+  - Valida la respuesta: `type` dentro del enum y `title` de hasta 150 caracteres.
+  - Si no hay API key, o ante error, 429, timeout o respuesta inválida, usa el motor heurístico local.
+- **Persistencia idempotente:** `POST /api/v1/recommendations` deduplica por `transaction_id` (índice único `uq_ai_recs_transaction` + captura de `23505`).
+- **MLOps** (ciclo de vida, *data drift*, recursos): es **diseño**. Lo único implementado son contadores en memoria y `/model-info` con `dataDriftStatus: "not_implemented"`.
 
-Para identificar problemas de rendimiento, degradación del servicio o fallos, se definen los siguientes pilares de observabilidad y la justificación de cada dato seleccionado:
+---
 
-#### A. Métricas Clave y su Utilidad Diagnóstica
+## 4. Observabilidad y trazabilidad
 
-| Métrica | Tipo | Utilidad para Diagnóstico |
-| :--- | :--- | :--- |
-| `smartbancs_transaction_duration_seconds` (p95, p99) | Histograma | **Indicador primario de degradación.** Si el percentil 95 supera 500ms, indica contención en la BD (locks o pool agotado). Si supera 2s, hay violación del SLA. Permite distinguir entre degradación gradual (leak de conexiones) y fallo abrupto (deadlock masivo). |
-| `smartbancs_transactions_total` (rate por minuto) | Counter + Rate | **Volumen transaccional (TPS).** Permite detectar picos anómalos (quincena, Black Friday) y correlacionar con latencia. Una caída súbita de TPS con latencia alta sugiere bloqueo generalizado. |
-| `smartbancs_deadlocks_detected_total` | Counter | **Señal de alarma de concurrencia.** Cualquier incremento > 0 requiere investigación inmediata. En nuestro diseño con lock ordering, un deadlock sería indicativo de un bug o una ruta de código no protegida. |
-| `http_request_duration_seconds` por ruta | Histograma | **Localización del cuello de botella.** Si solo `/api/v1/transactions` tiene latencia alta pero `/api/v1/accounts` responde en < 5ms, el problema está en la lógica transaccional y no en la red o el servidor. |
-| Logs con `correlationId` y `durationMs` | Texto estructurado | **Trazabilidad de flujo completo.** Permite reconstruir la secuencia exacta de eventos de una transacción fallida: desde la recepción HTTP → lock en BD → commit → publicación a RabbitMQ → consumo por IA. Esencial para el análisis post-mortem. |
+### 4.1. Instrumentación implementada
 
-#### B. Alertas Propuestas (Prometheus → Alertmanager)
+**Logs (R3.4a–d).**
 
-| Alerta | Condición | Severidad | Acción |
+- **Backend** ([logger.service.ts](../backend/src/common/logger/logger.service.ts), Winston):
+  - Con `NODE_ENV=production` (el valor de compose) o `LOG_FORMAT=json`, emite una línea JSON por evento con `timestamp` ISO-8601, `level`, `service`, `environment`, `message` y los campos de contexto (`correlationId`, `transactionId`, `durationMs`, `sqlstate`, `attempt`, `query`).
+  - En desarrollo usa un formato legible.
+- **Qué se registra en el backend:**
+  - Inicio y fin de cada transferencia, con duración.
+  - Errores con SQLSTATE, número de intento y la consulta que falló (`error.query`).
+  - Reintentos por conflicto.
+  - Replays idempotentes.
+  - Publicación confirmada o no confirmada de cada evento.
+  - Backlog del outbox.
+  - Cada petición HTTP (el interceptor [logging.interceptor.ts](../backend/src/common/interceptors/logging.interceptor.ts) registra método, URL, estado, duración y correlationId).
+- **ai-service** ([log_context.py](../ai-service/log_context.py)): logs de texto (no JSON) con `corrId`, `txId` y `eventId` en cada línea que se emite mientras se procesa un evento. Registra las llamadas a Gemini (latencia, 429, timeout, respuesta inválida), el uso del fallback, el POST al backend y los envíos a la DLQ.
+- **PostgreSQL** (flags en [docker-compose.yml](../docker-compose.yml)):
+  - `log_min_duration_statement=500`: toda sentencia de más de 500 ms queda en el log.
+  - `log_lock_waits=on` con `deadlock_timeout=1s`: registra la espera y el PID que bloquea.
+  - `pg_stat_statements`, creado por [00-observability.sql](../backend/sql/00-observability.sql).
+  - `DB_LOGGING` de TypeORM está desactivado.
+
+**Métricas Prometheus (R3.4e–g).** La lista es exacta y viene de [metrics.service.ts](../backend/src/common/metrics/metrics.service.ts). Todas llevan la etiqueta por defecto `app="smartbancs-backend"` y se exponen en `GET /metrics` del backend. También se exportan las métricas por defecto de `prom-client` (`process_*`, `nodejs_*`).
+
+| Métrica | Tipo | Labels | Qué mide |
 | :--- | :--- | :--- | :--- |
-| `HighTransactionLatency` | `histogram_quantile(0.95, smartbancs_transaction_duration_seconds) > 1.0` durante 2 min | WARNING | Notificar en Slack al equipo de guardia |
-| `SLAViolation` | `histogram_quantile(0.95, ...) > 2.0` durante 1 min | CRITICAL | Pager al SRE + ejecutar runbook de mitigación |
-| `DeadlockDetected` | `rate(smartbancs_deadlocks_detected_total[1m]) > 0` | CRITICAL | Investigación inmediata + consulta `pg_locks` |
-| `ConnectionPoolExhaustion` | `smartbancs_db_active_connections > 24` (80% de `DB_POOL_MAX`=30) o `smartbancs_db_pool_waiting_requests > 0` durante 1m | WARNING | Evaluar escalado o PgBouncer |
-| `HighErrorRate` | `rate(http_requests_total{status_code=~"5.."}[5m]) / rate(http_requests_total[5m]) > 0.05` | CRITICAL | Circuit breaker + diagnóstico de logs |
+| `http_requests_total` | Counter | `method`, `route`, `status_code` | Peticiones HTTP. `route` es la plantilla de la ruta (p. ej. `/api/v1/transactions/:id`), o `unmatched` si no hubo ruta. `/metrics` se excluye. |
+| `http_request_duration_seconds` | Histogram | `method`, `route`, `status_code` | Latencia HTTP. Buckets: 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5 s. |
+| `smartbancs_transactions_total` | Counter | `status` (`COMPLETED`, `FAILED`), `category` | Transferencias procesadas. `FAILED` incluye rechazos de negocio (fondos insuficientes, 404, 422) y errores técnicos. Los replays idempotentes no se cuentan. |
+| `smartbancs_transaction_duration_seconds` | Histogram | `status` | Duración de la transferencia en el servicio, incluidos la espera de conexión del pool y los reintentos. Buckets: 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2 s. |
+| `smartbancs_db_errors_total` | Counter | `sqlstate` | Errores de BD por SQLSTATE (`40P01`, `40001`, `55P03`, `57014`, `23505`, ...) y `POOL_TIMEOUT` cuando el pool no entrega conexión en `connectionTimeoutMillis` (5 s). |
+| `smartbancs_deadlocks_detected_total` | Counter | `sqlstate` (`40P01`, `55P03`) | Deadlocks **y** lock timeouts. Para contar solo deadlocks hay que filtrar `sqlstate="40P01"`. |
+| `smartbancs_transaction_retries_total` | Counter | `sqlstate` | Reintentos automáticos por `40P01` o `40001`. |
+| `smartbancs_db_active_connections` | Gauge | — | Conexiones del pool en uso (`totalCount - idleCount`), leídas en cada scrape. |
+| `smartbancs_db_pool_waiting_requests` | Gauge | — | Peticiones esperando conexión del pool, leídas en cada scrape (cada 5 s: puede no captar picos cortos). |
+| `smartbancs_outbox_pending_events` | Gauge | — | Eventos del outbox sin publicar. Lo actualiza el relay tras cada lote. |
+| `smartbancs_ai_recommendation_duration_seconds` | Histogram | `engine` (`gemini`, `heuristic`, `unknown`) | Latencia de inferencia que reporta el ai-service en `metadata.inferenceLatencyMs`. Se observa en el backend al recibir `POST /api/v1/recommendations`, incluidos los reenvíos duplicados. Buckets: 0.01 a 10 s. |
 
-#### C. Dashboards de Grafana Propuestos
-1. **Panel Transaccional:** TPS en tiempo real, latencia p50/p95/p99, tasa de éxito/fallo, distribución por categoría.
-2. **Panel de Infraestructura BD:** Conexiones activas del pool, queries activas en `pg_stat_activity`, locks en tablas `accounts`/`transactions`.
-3. **Panel de RabbitMQ:** Profundidad de colas `ai.queue` y `bancs.sync.queue`, tasa de consumo, mensajes sin ack.
-4. **Panel de IA:** Latencia de inferencia, total de recomendaciones generadas, distribución por tipo.
+El ai-service **no expone `/metrics`**. Sus contadores (`totalInferences`, `geminiInferences`, `fallbackInferences`, `messagesAcked`, `messagesDeadLettered`) son variables en memoria que se ven en `GET /health` y `GET /model-info`. Prometheus solo scrapea el backend ([prometheus.yml](../docker/prometheus/prometheus.yml), `scrape_interval: 5s`). No se scrapean RabbitMQ ni PostgreSQL.
 
-La combinación de métricas cuantitativas (Prometheus), logs cualitativos con trazabilidad (Winston + correlationId) y visualización agregada (Grafana) proporciona los **tres pilares de la observabilidad** (métricas, logs y trazas) necesarios para diagnosticar cualquier incidente en la plataforma.
+**Trazabilidad (R3.4h).** El recorrido del correlation ID es este:
 
----
+1. `CorrelationIdMiddleware` acepta `x-correlation-id` del cliente si cumple `^[A-Za-z0-9._:-]{1,64}$`; si no, genera un UUID. Lo devuelve en la respuesta (el header está expuesto por CORS).
+2. Se guarda en `transactions.correlation_id` y en `outbox_events.correlation_id`.
+3. Viaja en el mensaje AMQP (body y `properties.correlationId`, con `messageId` = `eventId`).
+4. El ai-service lo pone en el contexto de logs y lo reenvía como header `x-correlation-id` en el `POST /api/v1/recommendations`. Ese POST lo registra el interceptor del backend.
 
-## 5. Operaciones: Incidente Crítico Simulado de Quincena
+**Brechas:** `ai_recommendations` no guarda el correlation ID (sí guarda `metadata.eventId`), y el log "New AI recommendation saved" del servicio de recomendaciones no lo incluye. No hay trazas distribuidas (OpenTelemetry): la correlación es por ID en los logs.
 
-### 5.1. Descripción del Escenario
-Durante un pico de quincena, se genera un alto volumen de transferencias concurrentes. Sin un diseño adecuado, esto causaría:
-1. **Deadlocks:** Transacción 1 bloquea Cuenta A y espera Cuenta B; Transacción 2 bloquea Cuenta B y espera Cuenta A.
-2. **Agotamiento del Connection Pool:** Conexiones retenidas indefinidamente esperando locks, disparando errores de timeout.
+**Dashboard Grafana (implementado, [smartbancs_dashboard.json](../docker/grafana/dashboards/smartbancs_dashboard.json)).** Hay un dashboard, "SmartBancs - Core Metrics Overview", con dos paneles:
 
-### 5.2. Solución y Prevención en Código
-1. **Ordenamiento Determinista de Bloqueos:**
-   En `transactions.service.ts`, los números de cuenta siempre se ordenan alfabéticamente antes de solicitar el lock pesimista:
-   ```typescript
-   const accountsToLock = [sourceAccountNumber, targetAccountNumber].sort();
-   // Siempre se bloquea primero la cuenta menor y luego la mayor
-   ```
-   Esto elimina matemáticamente la posibilidad de un ciclo de espera circular (condición de Coffman), **impidiendo que ocurra un deadlock**.
-2. **Ajuste de Connection Pool y Timeouts:**
-   Configuración de `idleTimeoutMillis: 30000` y `connectionTimeoutMillis: 5000` en TypeORM/Postgres para liberar recursos rápidamente en situaciones de estrés.
-3. **Timeouts por transacción:**
-   Cada transferencia ejecuta `SET LOCAL lock_timeout = '2000ms'` y `SET LOCAL statement_timeout = '5000ms'` (configurables con `DB_LOCK_TIMEOUT_MS` y `DB_STATEMENT_TIMEOUT_MS`). Una fila bloqueada o una consulta lenta ya no retienen la conexión indefinidamente: la petición falla rápido con `503` y libera el pool.
-4. **Detección y reintento por SQLSTATE:**
-   Los errores se clasifican por código SQLSTATE de PostgreSQL, no por el texto del mensaje: `40P01` (deadlock) y `40001` (serialización) se reintentan hasta 3 veces con *backoff* y *jitter*; `55P03` (lock timeout) y `57014` (statement timeout) devuelven `503`. Todos se registran en `smartbancs_db_errors_total` y `smartbancs_deadlocks_detected_total`, y el log de error incluye SQLSTATE, número de intento y la consulta exacta que falló.
-5. **Idempotencia:**
-   `POST /api/v1/transactions` acepta el header `Idempotency-Key` (índice único parcial en `transactions.idempotency_key`). Si un cliente reintenta tras un timeout, recibe la transacción original en lugar de generar un segundo débito, incluso si los reintentos llegan en paralelo.
-6. **Prueba de concurrencia automatizada (`backend/test/concurrency.int-spec.ts`):**
-   Se ejecuta contra PostgreSQL real con `npm run test:int` y verifica: 400 transferencias cruzadas en paralelo conservan el dinero total y no dejan saldos negativos; 50 débitos simultáneos de $10 sobre $100 aprueban exactamente 10; 20 reintentos con la misma `Idempotency-Key` debitan una sola vez; y con RabbitMQ caído los eventos quedan en el outbox y se publican al recuperarse. Se comprobó que la prueba falla si se elimina el lock pesimista.
+- "SmartBancs Transactions Total": `sum by (status) (rate(smartbancs_transactions_total[1m]))`.
+- "Transaction Latency (p95)": `histogram_quantile(0.95, sum(rate(smartbancs_transaction_duration_seconds_bucket[1m])) by (le))`.
 
-### 5.3. Monitoreo Práctico en Código
-El endpoint `GET /api/v1/simulation/db-diagnostics` (implementado en `simulation.service.ts`) ejecuta directamente contra PostgreSQL:
-- **`pg_stat_activity`:** Identifica qué queries están activas, en qué estado (`active`, `idle in transaction`), su duración y si están esperando un evento de bloqueo (`wait_event_type`, `wait_event`). Esto permite encontrar el proceso exacto que causa el cuello de botella.
-- **`pg_locks`:** Muestra qué filas de las tablas `accounts` y `transactions` están bloqueadas, en qué modo (`RowExclusiveLock`, `ShareLock`) y si el lock fue concedido o está en espera. Un lock `granted = false` sobre una tabla indica contención activa.
+El resto de los paneles de la sección 4.2 son propuestas. Hasta que existan, se consultan en Prometheus (`:9090`) con el PromQL de la tabla.
 
-Además, el PostgreSQL del `docker-compose.yml` arranca con `pg_stat_statements` (ranking de consultas por tiempo total y medio), `log_lock_waits=on` con `deadlock_timeout=1s` (registra la consulta bloqueada y el PID que la bloquea) y `log_min_duration_statement=500` (toda consulta de más de 500 ms queda en el log). Las consultas del runbook están en `backend/sql/00-observability.sql`.
+### 4.2. Diseño de observabilidad (R3.4i, R3.4j)
 
-### 5.4. Plan de Mitigación Inmediata (Runbook de Emergencia)
-En caso de presentarse degradación en quincena:
-1. **Finalizar conexiones bloqueadas** — Libera inmediatamente locks retenidos:
-   ```sql
-   SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-   WHERE state = 'idle in transaction' AND now() - state_change > interval '5 seconds';
-   ```
-2. **Habilitar Rate Limiting** en API Gateway (NGINX/Kong) para admitir hasta 10,000 req/s y encolar el excedente con respuesta `429 Too Many Requests`.
-3. **Escalar horizontalmente** réplicas de lectura para queries de saldos (`GET /accounts/:id/balance`), descargando la primaria.
-4. **Reducir `DB_POOL_MAX`** temporalmente si se detecta que las conexiones están siendo retenidas sin liberarse (evita que la BD se sature con conexiones zombi).
+**Señales y por qué sirven.** Todas las consultas usan métricas que existen hoy.
 
----
+| Señal | PromQL | Utilidad diagnóstica |
+| :--- | :--- | :--- |
+| Latencia p95/p99 de la transferencia | `histogram_quantile(0.95, sum by (le) (rate(smartbancs_transaction_duration_seconds_bucket{status="COMPLETED"}[5m])))` | Indicador directo del SLA de 2 s. El bucket finito más alto es 2 s: si el p95 cae en `+Inf`, `histogram_quantile` devuelve 2, y eso ya significa SLA violado. |
+| Volumen (TPS) | `sum(rate(smartbancs_transactions_total{status="COMPLETED"}[1m]))` | Detecta el pico y lo correlaciona con la latencia. Si el TPS cae mientras la latencia sube, hay contención (locks o pool). |
+| Tasa de error 5xx de transferencias | `sum(rate(http_requests_total{method="POST",route="/api/v1/transactions",status_code=~"5.."}[5m])) / sum(rate(http_requests_total{method="POST",route="/api/v1/transactions"}[5m]))` | Error visible al cliente. Se usa 5xx y no `FAILED` porque `FAILED` incluye rechazos de negocio legítimos. Las dos sumas agregan antes de dividir: si no, el cociente se evalúa serie a serie y da 1. |
+| Causa del error por SQLSTATE | `sum by (sqlstate) (rate(smartbancs_db_errors_total[5m]))` | Distingue lock timeout (`55P03`, contención de fila), statement timeout (`57014`, consulta lenta), deadlock (`40P01`) y pool agotado (`POOL_TIMEOUT`). Cada uno lleva a una acción distinta. |
+| Deadlocks reales | `sum(increase(smartbancs_deadlocks_detected_total{sqlstate="40P01"}[5m]))` | Con locks ordenados, un deadlock indica que otro proceso escribe `accounts` en otro orden. |
+| Saturación del pool | `max(smartbancs_db_active_connections)` frente a `DB_POOL_MAX` (30); `max(smartbancs_db_pool_waiting_requests)` | Si hay espera sostenida en el pool, la latencia viene de la cola de conexiones y no de la consulta. |
+| Reintentos | `sum by (sqlstate) (rate(smartbancs_transaction_retries_total[5m]))` | Muestra conflictos que se resolvieron sin error visible. Si suben, la contención está creciendo. |
+| Backlog del outbox | `max(smartbancs_outbox_pending_events)` | Si crece de forma sostenida, el broker está caído o el relay no da abasto. La IA y Bancs se atrasan, pero las transferencias no. |
+| Latencia de IA por motor | `histogram_quantile(0.95, sum by (le, engine) (rate(smartbancs_ai_recommendation_duration_seconds_bucket[5m])))` | Degradación de Gemini. La proporción de `engine="heuristic"` indica cuánto se usa el fallback. |
+| Latencia HTTP por ruta | `histogram_quantile(0.95, sum by (le, route) (rate(http_request_duration_seconds_bucket[5m])))` | Localiza el problema: si solo la ruta de transferencias está lenta y las lecturas no, el problema está en la ruta de escritura. |
+| Disponibilidad del backend | `up{job="smartbancs-backend"}` | Scrape fallido = proceso caído o inaccesible. |
+| Logs con `correlationId` | (Loki/ELK, diseño) | Reconstruyen una transacción concreta: HTTP → BD → outbox → broker → IA → POST. |
+| `pg_stat_statements`, `log_lock_waits`, `db-diagnostics` | SQL (sección 5.3) | Dan la consulta y el PID exactos: la métrica dice *qué* pasa y estas fuentes dicen *dónde*. |
 
-## 6. Gestión de Incidentes TI: Post-Mortem
+**Alertas: PROPUESTA, no configurada.** `prometheus.yml` no tiene `rule_files` ni `alerting`, y compose no incluye Alertmanager. Las reglas propuestas son estas:
 
-### 6.1. Ficha del Incidente
-
-| Campo | Detalle |
-| :--- | :--- |
-| **Identificador** | INC-202609-001 |
-| **Título** | Incremento severo de latencia y timeouts en transferencias durante pico de quincena |
-| **Severidad** | P1 (Crítica — impacto directo en clientes) |
-| **Servicios Afectados** | SmartBancs Backend Core (NestJS), PostgreSQL |
-| **Tiempo de Detección (MTTD)** | 2 minutos |
-| **Tiempo de Recuperación (MTTR)** | 12 minutos |
-| **Impacto** | ~350 transferencias fallidas, ~2,000 usuarios con timeouts durante la ventana de incidente |
-
-### 6.2. Línea de Tiempo del Incidente
-
-| Hora (UTC) | Evento |
-| :--- | :--- |
-| **15:00** | Inicio del pico transaccional de quincena. TPS sube de 200 a 3,500 req/s. |
-| **15:02** | Alerta `HighTransactionLatency` disparada: p95 supera 1.0s. Equipo de guardia notificado por Slack. |
-| **15:03** | Alerta `SLAViolation` disparada: p95 supera 2.0s. Pager al SRE on-call. |
-| **15:04** | SRE consulta dashboard Grafana. Detecta: `db_active_connections = 25/25` (pool agotado), múltiples queries en estado `idle in transaction` con duración > 8s. |
-| **15:05** | SRE ejecuta `pg_stat_activity` vía endpoint `/db-diagnostics`. Identifica que las queries bloqueadas son `SELECT ... FOR UPDATE` sobre la tabla `accounts` con locks cruzados entre pares de cuentas. |
-| **15:06** | SRE ejecuta el runbook: `pg_terminate_backend()` sobre las 12 conexiones en `idle in transaction` > 5 segundos. Libera locks inmediatamente. |
-| **15:07** | Latencia p95 baja a 800ms. Pool de conexiones recupera disponibilidad (15/25 activas). |
-| **15:09** | SRE habilita rate limiting temporal: 5,000 req/s max con cola de espera en NGINX. |
-| **15:12** | Latencia p95 estabilizada en 120ms. TPS normalizado a 2,800 req/s. Incidente declarado **RESUELTO**. |
-| **15:30** | Post-mortem iniciado. |
-
-### 6.3. Causa Raíz (Root Cause Analysis)
-El endpoint de transferencias adquiría locks pesimistas sobre las cuentas sin un orden determinista. Bajo alta concurrencia, dos transacciones concurrentes podían intentar bloquear las mismas cuentas en orden inverso, generando un ciclo de espera circular (deadlock). PostgreSQL detectaba y abortaba algunos de estos deadlocks, pero las transacciones reintentadas saturaban el connection pool (25 conexiones max), provocando timeouts en cascada para todas las operaciones.
-
-### 6.4. Corrección Aplicada (Fix Permanente)
-Se implementó el **ordenamiento lexicográfico de cuentas** antes de adquirir el lock pesimista en `transactions.service.ts`:
-```typescript
-const accountsToLock = [sourceAccountNumber, targetAccountNumber].sort();
-```
-Esta corrección elimina la posibilidad matemática de deadlocks por la ausencia de la condición de espera circular (una de las 4 condiciones de Coffman).
-
-### 6.5. Acciones Preventivas (Plan de Acción)
-
-| Ámbito | Acción | Responsable | Plazo |
+| Alerta | Expresión | `for` | Severidad |
 | :--- | :--- | :--- | :--- |
-| **Código** | ✅ *Implementado:* `lock_timeout` y `statement_timeout` por transacción con respuesta `503` en lugar de retener la conexión. Pendiente: circuit breaker (ej. `opossum`) para cortar tráfico cuando la tasa de `503` supere un umbral. | Backend Team | Sprint 1 |
-| **Código** | ✅ *Implementado:* prueba de concurrencia automatizada contra PostgreSQL real (`npm run test:int`): conservación de saldos, doble gasto, idempotencia y outbox. Pendiente: ejecutarla en el pipeline de CI en cada merge. | QA/Backend | Sprint 1 |
-| **Infraestructura** | Desplegar **PgBouncer** como proxy de connection pooling frente a PostgreSQL para soportar hasta 10,000 conexiones lógicas con un pool físico de 50 conexiones. | SRE/Infra | Sprint 2 |
-| **Infraestructura** | Configurar réplicas de lectura de PostgreSQL para descargar queries de consulta (`GET /accounts`, `GET /transactions`) de la instancia primaria. | SRE/Infra | Sprint 2 |
-| **Monitoreo** | Crear alerta `ConnectionPoolSaturation` que dispare cuando `db_active_connections` supere el 80% del máximo configurado (`DB_POOL_MAX`). | SRE | Sprint 1 |
-| **Monitoreo** | Agregar runbook automatizado: si `DeadlockDetected` se dispara 3 veces en 1 minuto, ejecutar automáticamente la terminación de sesiones bloqueadas. | SRE | Sprint 2 |
-| **Proceso** | Realizar pruebas de carga periódicas (mensualmente) simulando el escenario de quincena con el endpoint `POST /simulation/quincena-spike` antes de cada ventana de alto tráfico. | QA/Ops | Recurrente |
+| `TransferLatencyHigh` | `histogram_quantile(0.95, sum by (le) (rate(smartbancs_transaction_duration_seconds_bucket[5m]))) > 1` | 2m | SEV-3 (aviso) |
+| `TransferSLAViolation` | `histogram_quantile(0.95, sum by (le) (rate(smartbancs_transaction_duration_seconds_bucket[5m]))) >= 2` | 1m | SEV-1 |
+| `TransferErrorRateHigh` | Cociente 5xx de la tabla anterior `> 0.05` | 2m | SEV-1 |
+| `DbPoolSaturated` | `max(smartbancs_db_pool_waiting_requests) > 0` o `max(smartbancs_db_active_connections) >= 24` (80 % de 30) | 1m | SEV-2 |
+| `DbPoolTimeouts` | `sum(increase(smartbancs_db_errors_total{sqlstate="POOL_TIMEOUT"}[5m])) > 0` | 0m | SEV-2 |
+| `LockContention` | `sum(rate(smartbancs_db_errors_total{sqlstate="55P03"}[5m])) > 1` | 2m | SEV-2 |
+| `DeadlockDetected` | `sum(increase(smartbancs_deadlocks_detected_total{sqlstate="40P01"}[5m])) > 0` | 0m | SEV-2 |
+| `OutboxBacklogGrowing` | `max(smartbancs_outbox_pending_events) > 1000` | 5m | SEV-3 |
+| `BackendDown` | `up{job="smartbancs-backend"} == 0` | 1m | SEV-1 |
+
+Los umbrales son valores iniciales y se calibran con la línea base de producción. Para demostrar las reglas no hace falta Alertmanager: basta con montarlas en `rule_files` y verlas en la pestaña Alerts de Prometheus.
+
+**Dashboards propuestos (no existen en el repositorio):**
+
+1. **Transaccional:** TPS, p50/p95/p99, 5xx por ruta, `FAILED` por categoría.
+2. **Base de datos:** pool activo y en espera, errores por SQLSTATE, reintentos y, con `postgres_exporter` (diseño), locks y sesiones `idle in transaction`.
+3. **Mensajería:** backlog del outbox y, con el plugin `rabbitmq_prometheus` (diseño), profundidad de `smartbancs.ai.queue`, `smartbancs.ai.dlq` y `smartbancs.bancs.sync.queue`.
+4. **IA:** latencia p95 por motor y proporción de fallback. Los mensajes enviados a la DLQ requieren exponer `/metrics` en el ai-service (diseño).
+
+---
+
+## 5. Operaciones: incidente de quincena (R3.5)
+
+### 5.1. Escenario y mecanismo
+
+El enunciado describe tres síntomas en un pico de quincena: latencia alta, timeouts de conexión con la BD y posibles deadlocks. Sobre este sistema, la cadena causal es esta:
+
+1. **Contención de fila.** Cada transferencia toma `FOR UPDATE` sobre las dos cuentas y retiene los locks hasta el `COMMIT`. Si muchas transferencias tocan la misma cuenta (por ejemplo, la cuenta pagadora de nómina), se serializan.
+2. **Pool retenido.** Mientras una transacción espera un lock, retiene una conexión del pool (máximo 30). Con suficientes esperas, el pool se llena.
+3. **Timeout de conexión.** Las peticiones siguientes esperan conexión en la cola de `pg-pool` hasta `connectionTimeoutMillis` (5 s, [app.module.ts](../backend/src/app.module.ts)) y fallan con "timeout exceeded when trying to connect".
+4. **Deadlocks.** Dos transferencias sobre las mismas cuentas no pueden hacer deadlock entre sí, porque ambas bloquean en el mismo orden. Un deadlock requiere otro proceso que escriba `accounts` en otro orden.
+
+### 5.2. Controles implementados en el código
+
+| Control | Dónde | Efecto |
+| :--- | :--- | :--- |
+| Locks en orden determinista | `executeTransfer`: `const [firstAccNum, secondAccNum] = [sourceAccountNumber, targetAccountNumber].sort();` | Elimina el ciclo de espera entre dos transferencias sobre las mismas cuentas. El reintento por `40P01` queda como defensa en profundidad para rutas no previstas. |
+| Aritmética en SQL | `UPDATE accounts SET balance = balance - $1::numeric ... WHERE account_number = $2 AND balance >= $1::numeric RETURNING balance` | El débito es condicional al saldo y exacto en `NUMERIC`: no hay errores de redondeo de `float` ni doble gasto. |
+| `lock_timeout` y `statement_timeout` por transacción | `SET LOCAL lock_timeout = '2000ms'` y `SET LOCAL statement_timeout = '5000ms'` (`DB_LOCK_TIMEOUT_MS`, `DB_STATEMENT_TIMEOUT_MS`) | Una fila bloqueada o una consulta lenta no retienen la conexión indefinidamente. |
+| Clasificación por SQLSTATE | `processTransaction`, `pgErrorCode`, `isPoolTimeout` | `40P01` y `40001` se reintentan hasta 2 veces (`TX_MAX_ATTEMPTS=3` intentos en total), con backoff `20·intento + jitter(0–30) ms`. Al agotarse, o ante `55P03`, `57014` o `POOL_TIMEOUT`, responde `503` (reintentable por el cliente). Todo queda en `smartbancs_db_errors_total`. |
+| Idempotencia | Header `Idempotency-Key` + índice único parcial `uq_transactions_idempotency_key` | Un reintento del cliente tras un `503` o un timeout no produce un segundo débito. La misma clave con otro payload responde `422`. |
+| Outbox | La sección 2.1 | Una caída del broker o de la IA no afecta a la transferencia. |
+| Prueba automatizada | [concurrency.int-spec.ts](../backend/test/concurrency.int-spec.ts) (12 pruebas) | Conservación de saldos, doble gasto, montos al centavo, idempotencia, pool agotado → `503` + `POOL_TIMEOUT`, y relay con confirmaciones. |
+
+No está configurado: `idle_in_transaction_session_timeout` (se propone en la sección 6), circuit breaker, rate limiting en la API ni PgBouncer.
+
+### 5.3. Cómo se identifica el proceso exacto (R3.5a–c, implementado)
+
+- **Cuello de botella y consulta exacta (R3.5a):**
+  - `GET /api/v1/simulation/db-diagnostics` (`SimulationService.getDatabaseDiagnostics`, requiere `SIMULATION_ENABLED=true`) devuelve lo siguiente:
+    - `blockingChains`: quién bloquea a quién, con `pg_blocking_pids`, la consulta de ambos lados, los segundos de espera y la antigüedad de la transacción que bloquea.
+    - `activeQueries` de `pg_stat_activity`, con `wait_event` y duración.
+    - Conteo de sesiones `idle in transaction` de más de 5 s.
+    - Estado del pool (`total`, `idle`, `waiting`).
+    - Un `healthStatus` calculado a partir de esos datos (`HEALTHY`, `DEGRADED` o `CRITICAL`), con una acción recomendada.
+  - Además: `pg_stat_statements` (ranking por tiempo total y medio) y `log_min_duration_statement`. Las consultas del runbook están en [00-observability.sql](../backend/sql/00-observability.sql).
+- **Timeouts de conexión (R3.5b):** `smartbancs_db_errors_total{sqlstate="POOL_TIMEOUT"}`, los gauges `smartbancs_db_active_connections` y `smartbancs_db_pool_waiting_requests`, y el log de error con `sqlstate: "POOL_TIMEOUT"` y `correlationId`.
+- **Deadlocks y locks (R3.5c):**
+  - `smartbancs_db_errors_total{sqlstate="40P01"}` y `{sqlstate="55P03"}`, y `smartbancs_transaction_retries_total`.
+  - El log de error del backend incluye `sqlstate`, `attempt` y `query`.
+  - El log de PostgreSQL registra, gracias a `log_lock_waits` y a su propio detector de deadlocks, las sentencias y los PIDs involucrados.
+
+### 5.4. Acciones inmediatas (R3.5d, runbook)
+
+Principio: estabilizar primero y diagnosticar a fondo después. Los pasos van en orden de menor a mayor impacto.
+
+1. **Confirmar el alcance con datos.** Mirar el p95, la tasa 5xx, los errores por SQLSTATE y el pool (consultas de la sección 4.2). Decidir la severidad (sección 6.2).
+2. **Encontrar la cabeza de la cadena de bloqueo** con `db-diagnostics` (`blockingChains.blocking_pid`) o con la consulta 2 de `00-observability.sql`.
+3. **Liberar locks.** Primero `SELECT pg_cancel_backend(<pid>);`, que cancela solo la consulta. Si la sesión está `idle in transaction` o no cede, usar `SELECT pg_terminate_backend(<pid>);`. Se aplica a la cabeza de la cadena, no a todas las sesiones en espera.
+4. **Quitar carga no esencial.**
+   - Pausar jobs batch que escriban `accounts` y los reportes pesados.
+   - Si hace falta, detener el ai-service (sus eventos esperan en la cola).
+   - Si el broker es el problema, desplegar las réplicas sobrantes con `OUTBOX_RELAY_ENABLED=false` (requiere reiniciarlas; los eventos esperan en `outbox_events`).
+5. **Control de admisión y red.**
+   - Rate limit en el gateway o balanceador (diseño: no hay gateway en el MVP), respondiendo `429`/`503` con `Retry-After`.
+   - Alinear los timeouts del gateway con los del servicio para que no reintente peticiones que el backend ya está procesando.
+   - Drenar el tráfico de nodos degradados.
+6. **Balancear y escalar con criterio.** Agregar réplicas de la API solo si el cuello no es la BD. Si es el pool o los locks, más réplicas empeoran la situación. Mover las lecturas de saldo e historial a una réplica de lectura (diseño).
+7. **Revertir** el último despliegue o cambio de configuración si coincide con el inicio del incidente.
+8. Registrar cada acción con su hora en el documento vivo del incidente.
+
+---
+
+## 6. Gestión de incidentes TI: escalamiento y post mortem (R3.6)
+
+### 6.1. Proceso de escalamiento (R3.6b, propuesta de proceso)
+
+**Severidades:**
+
+| Severidad | Criterio | Acuse de recibo | Quién se involucra | Comunicación |
+| :--- | :--- | :--- | :--- | :--- |
+| SEV-1 | Transferencias fallando o SLA de 2 s violado para una fracción visible de clientes (p. ej. p95 ≥ 2 s o 5xx > 5 % durante más de 1 min). Si hay duda, se clasifica como SEV-1. | 5 min | On-call SRE (Incident Commander inicial), on-call backend, DBA on-call | Estado a negocio y a atención al cliente cada 30 min |
+| SEV-2 | Degradación parcial sin pérdida de transferencias: pool en espera, lock timeouts, IA o Bancs atrasados. | 15 min | On-call SRE y dueño del servicio | Canal del incidente cada 60 min |
+| SEV-3 | Riesgo sin impacto al cliente: backlog del outbox o fallback de IA. | Horario laboral | Equipo dueño | Ticket |
+
+**Cadena:**
+
+1. Alerta.
+2. On-call SRE: confirma y declara, y asume el rol de Incident Commander.
+3. En SEV-1, a los 10 min: DBA on-call + on-call backend. Se asignan los roles de Operaciones (el único que toca producción), Comunicación y Planificación.
+4. Si el SEV-1 no está mitigado en 30 min: jefe de ingeniería y responsable de negocio. Si hay riesgo sobre saldos o Bancs: equipo del core Bancs.
+5. Cierre: el IC declara el incidente resuelto tras 30 min estables y abre el post mortem, que se entrega en un máximo de 5 días hábiles.
+
+**Criterio para declarar un incidente:** hay impacto visible al cliente, hace falta otro equipo, o no se resuelve en 1 h de análisis.
+
+### 6.2. Post mortem INC-QUINCENA-01 (R3.6a)
+
+> **Nota.** Es un incidente **simulado** para el reto. El escenario, el proceso batch y todas las cifras (horas, volúmenes, impacto) son hipotéticos y sirven para ilustrar el análisis. Los mecanismos, métricas, archivos y valores de configuración que se citan son los reales del repositorio. Se asume un despliegue productivo con las alertas propuestas en la sección 4.2 ya configuradas (en el MVP no existen).
+
+**Resumen.** Durante el pico de quincena, las transferencias que involucraban la cuenta pagadora de nómina y otras cuentas de alto tráfico empezaron a responder `503` y, luego, con demoras de más de 5 s. La causa fue contención de locks sobre filas calientes de `accounts`, amplificada por un proceso batch de conciliación (hipotético) que escribía `accounts` en un orden distinto al de la API. Estado: resuelto. Autores: SRE on-call y equipo backend. El formato es *blameless*.
+
+**Impacto (ilustrativo).**
+
+- 22 minutos de degradación (15:04–15:26), de los cuales 14 con el SLA violado (p95 ≥ 2 s).
+- Alrededor de 4 % de las transferencias respondieron `503` en la ventana. No hubo pérdida ni duplicación de dinero, por el `CHECK (balance >= 0)`, la aritmética condicional y la `Idempotency-Key`.
+- Las recomendaciones de IA y los eventos hacia Bancs se atrasaron unos minutos, pero no se perdieron: quedaron en el outbox y en las colas.
+
+**Línea de tiempo (UTC, ilustrativa).**
+
+| Hora | Evento |
+| :--- | :--- |
+| 15:00 | Empieza la dispersión de nómina: el TPS sobre la cuenta pagadora sube de forma abrupta. |
+| 15:02 | Arranca el job batch de conciliación, que actualiza saldos de `accounts` cuenta por cuenta en el orden del archivo recibido. |
+| 15:04 | `smartbancs_db_errors_total{sqlstate="55P03"}` sube: las transferencias en espera agotan el `lock_timeout` de 2 s y responden `503`. `smartbancs_transaction_retries_total{sqlstate="40P01"}` también sube. |
+| 15:06 | Se dispara `LockContention` (SEV-2). El on-call SRE acusa recibo. |
+| 15:09 | `smartbancs_db_active_connections` = 30/30 y `smartbancs_db_pool_waiting_requests` > 0. Aparecen `POOL_TIMEOUT`. Se disparan `DbPoolSaturated` y `DbPoolTimeouts`. |
+| 15:12 | Se dispara `TransferSLAViolation`: el p95 cae en el bucket `+Inf` (≥ 2 s). El IC declara SEV-1 y escala al DBA y al on-call backend. |
+| 15:15 | `db-diagnostics` devuelve `healthStatus: CRITICAL`. Las cabezas de `blockingChains` son sesiones del job batch con transacciones largas, y un grupo de transferencias espera sobre la fila de la cuenta pagadora. El log de PostgreSQL (`log_lock_waits`) muestra las esperas y los PIDs. |
+| 15:18 | Mitigación 1: se pausa el job batch y se cancelan sus sesiones (`pg_cancel_backend`, luego `pg_terminate_backend` para dos sesiones `idle in transaction`). Los `40P01` bajan a 0. |
+| 15:22 | Mitigación 2: rate limit temporal en el gateway para la cuenta pagadora. El pool deja de tener espera. |
+| 15:26 | El p95 vuelve bajo 1 s. `smartbancs_outbox_pending_events` drena el backlog. |
+| 15:56 | Tras 30 min estables, el IC declara el incidente resuelto, retira el rate limit temporal y abre el post mortem. El job batch queda suspendido hasta corregirlo (acciones 1 y 2). |
+
+**Detección.** Los primeros síntomas los detectaron las alertas propuestas de lock timeout y pool, antes de la violación del SLA. Punto débil: la alerta de SLA llegó 8 minutos después de los primeros `503`. En el MVP real no hay alertas configuradas: se habría detectado por reportes de usuarios o por el panel de p95 de Grafana.
+
+**Causa raíz.**
+
+1. **Hot row.** Todas las transferencias de nómina toman `FOR UPDATE` sobre la misma fila (la cuenta pagadora) y se serializan. Cuando la llegada supera el ritmo al que se libera ese lock, las esperas crecen hasta `lock_timeout` → **latencia** y `503` (`55P03`).
+2. **Pool retenido.** Cada transacción en espera retiene una de las 30 conexiones del pool durante hasta 2 s. Con el pool lleno, las peticiones nuevas esperan hasta 5 s en `pg-pool` → **timeouts de conexión** (`POOL_TIMEOUT`).
+3. **Orden de locks inconsistente entre procesos.** El job batch escribía `accounts` sin respetar el orden por `account_number` que usa la API. Se formaron ciclos de espera API ↔ batch → **deadlocks** (`40P01`). PostgreSQL los resuelve tras `deadlock_timeout` (1 s), pero mientras tanto cada ciclo retiene locks y conexiones.
+
+**Factores contribuyentes:** no hay control de admisión antes del pool; el job batch no tiene `lock_timeout` ni límite de duración de transacción; y no hay `idle_in_transaction_session_timeout`.
+
+**Resolución.** Se pausó el batch, se terminaron las sesiones que bloqueaban y se aplicó el rate limit. No hizo falta reiniciar la API. Los eventos pendientes se publicaron solos al drenar el outbox.
+
+**Lecciones aprendidas.**
+
+- **Qué funcionó:**
+  - La falla rápida (`lock_timeout` + `503`) evitó que las peticiones se colgaran indefinidamente.
+  - La clasificación por SQLSTATE separó contención (`55P03`), pool (`POOL_TIMEOUT`) y deadlock (`40P01`), y cada señal llevó a una acción distinta.
+  - El outbox aisló la IA y Bancs.
+- **Qué falló:**
+  - Faltaban un control de admisión y una regla común de orden de locks para todo proceso que escriba `accounts`.
+  - El único dashboard tenía dos paneles; el diagnóstico del pool se hizo con consultas manuales en Prometheus.
+- **Dónde hubo suerte:** el pico cayó en horario laboral, con el DBA disponible.
+
+**Acciones: ya implementadas en el repositorio (evidencia).**
+
+| Acción | Ámbito | Evidencia |
+| :--- | :--- | :--- |
+| `lock_timeout` y `statement_timeout` por transacción, con `503` | Código | `transactions.service.ts`, `executeTransfer` |
+| Reintento de `40P01`/`40001` con backoff y jitter; `503` al agotarse | Código | `transactions.service.ts`, `processTransaction` |
+| `POOL_TIMEOUT` → `503` + métrica | Código | `isPoolTimeout`, [prueba "Pool agotado"](../backend/test/concurrency.int-spec.ts) |
+| Idempotencia estricta (`422` con otro payload) | Código | `assertSameRequest`, índice `uq_transactions_idempotency_key` |
+| Diagnóstico con `pg_blocking_pids` y `healthStatus` calculado | Código | `simulation.service.ts`, `getDatabaseDiagnostics` |
+| `pg_stat_statements`, `log_lock_waits`, `log_min_duration_statement` | Infraestructura | [docker-compose.yml](../docker-compose.yml), [00-observability.sql](../backend/sql/00-observability.sql) |
+| Simulación de pico acotada (≤ 500 operaciones, ≤ 100 concurrentes) y deshabilitable | Código | `quincena-spike.dto.ts`, `SIMULATION_ENABLED` |
+
+**Acciones: propuestas (no implementadas).**
+
+| # | Acción | Tipo | Ámbito | Responsable | Plazo |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| 1 | Una sola función de lock para todo escritor de `accounts` (orden por `account_number`), más una regla de revisión de código | Prevenir | Código | Líder backend | Sprint 1 |
+| 2 | `lock_timeout` y duración máxima de transacción para roles batch (`ALTER ROLE batch SET lock_timeout = '2s'`); lotes cortos con commits frecuentes | Prevenir | Código / BD | DBA + dueño del job | Sprint 1 |
+| 3 | `idle_in_transaction_session_timeout = 10s` en PostgreSQL | Prevenir | Infraestructura | DBA | Sprint 1 |
+| 4 | Reglas de alerta de la sección 4.2 en `rule_files` + Alertmanager con rutas por severidad | Detectar | Infraestructura | SRE | Sprint 1 |
+| 5 | Paneles de pool, SQLSTATE, reintentos y outbox en Grafana | Detectar | Infraestructura | SRE | Sprint 1 |
+| 6 | Control de admisión en el gateway (rate limit por cliente y por cuenta) y circuit breaker que corte ante 503 sostenido | Mitigar | Infraestructura / Código | SRE + backend | Sprint 2 |
+| 7 | Tratamiento de la cuenta pagadora: subcuentas de dispersión o nómina como lote en el core | Prevenir | Código / Negocio | Arquitectura + negocio | Sprint 3 |
+| 8 | PgBouncer en modo transaction; réplicas de lectura para saldos e historial | Prevenir | Infraestructura | SRE / DBA | Sprint 2 |
+| 9 | Prueba de carga de quincena en **staging** antes de cada fecha pico (k6 + `quincena-spike`), con p95 y TPS versionados como evidencia | Proceso | QA / SRE | QA | Recurrente |
+| 10 | Ejecutar `npm run test:int` en CI en cada merge | Proceso | Código | Backend | Sprint 1 |
+
+**Información de soporte:** las consultas de la sección 5.3, el export del dashboard y los logs filtrados por `correlationId` de transacciones fallidas.
+
+---
+
+## 7. Trazabilidad con el reto
+
+Estados: **Implementado** = existe en el código y se puede ejecutar; **Diseño** = descrito en este documento, sin implementación; **Parcial** = una parte implementada y el resto en diseño.
+
+| ID | Requisito | Dónde | Estado |
+| :--- | :--- | :--- | :--- |
+| R3.1a | Endpoint de transacción | [transactions.controller.ts](../backend/src/modules/transactions/transactions.controller.ts) (`POST /api/v1/transactions`) | Implementado |
+| R3.1b | DDL | [schema.sql](../backend/sql/schema.sql) | Implementado |
+| R3.1c | DML semilla | [seed.sql](../backend/sql/seed.sql), `database/seeds/seed.service.ts` | Implementado |
+| R3.1d | Interacción real con BD | `transactions.service.ts` (TypeORM `QueryRunner` + SQL) | Implementado |
+| R3.1e | Concurrencia sin race conditions, con prueba | Sección 5.2; [concurrency.int-spec.ts](../backend/test/concurrency.int-spec.ts) | Implementado |
+| R3.1f | IaC en un comando | [docker-compose.yml](../docker-compose.yml) | Implementado |
+| R3.2a | Flujo app ↔ Bancs | Sección 2.1 | Parcial (outbox y cola implementados; CDC desde Bancs en diseño) |
+| R3.2b | Saldos sin saturar Bancs | Sección 2.1 (cola durable; worker con rate limiting) | Parcial (cola implementada; worker en diseño) |
+| R3.2c | Script ETL | [etl_bancs_processor.py](../etl-bancs/etl_bancs_processor.py) | Implementado |
+| R3.2d | Manejo de nulos | Sección 2.2 | Implementado |
+| R3.2e | Estandarización | Sección 2.2 | Implementado |
+| R3.2f | Salida para IA | `bancs_cleaned_features.json` | Implementado |
+| R3.3a | Servicio de IA independiente | `ai-service/` | Implementado |
+| R3.3b | Consumo asíncrono | Outbox → relay → RabbitMQ → `consumer.py` | Implementado |
+| R3.3c | La IA no afecta la latencia | `TransactionsService` sin dependencia de broker ni IA; prueba unitaria del outbox en [transactions.service.spec.ts](../backend/src/modules/transactions/transactions.service.spec.ts) | Implementado (sin medición de carga) |
+| R3.3d | Ciclo de vida del modelo | [IA_IMPLEMENTACION_Y_DESPLIEGUE.md](IA_IMPLEMENTACION_Y_DESPLIEGUE.md) §2.1 | Diseño |
+| R3.3e | Data drift | Ídem §2.2 (`/model-info` devuelve `not_implemented`) | Diseño |
+| R3.3f | Consumo de recursos | Ídem §2.3 (implementados: prefetch, timeout y límite de tokens; límites de contenedor en diseño) | Parcial |
+| R3.4a | Log de transacciones exitosas | Sección 4.1 | Implementado |
+| R3.4b | Log de errores | Sección 4.1 | Implementado |
+| R3.4c | Log de llamadas a IA | `advisor.py`, `consumer.py` | Implementado |
+| R3.4d | Log de interacciones con BD | Logs de transacción con `query`/`sqlstate`, logs de PostgreSQL | Implementado |
+| R3.4e | Métrica de volumen | `smartbancs_transactions_total`, `http_requests_total` | Implementado |
+| R3.4f | Métrica de errores | `smartbancs_db_errors_total`, 5xx en `http_requests_total` | Implementado |
+| R3.4g | Métrica de latencia | `smartbancs_transaction_duration_seconds`, `http_request_duration_seconds` | Implementado |
+| R3.4h | Trazabilidad entre componentes | Sección 4.1 (correlation ID de punta a punta) | Implementado (sin OpenTelemetry) |
+| R3.4i | Señales de degradación | Sección 4.2 (alertas propuestas) | Diseño |
+| R3.4j | Justificación de cada dato | Sección 4.2 | Diseño |
+| R3.5a | Consulta exacta del cuello de botella | `db-diagnostics`, `pg_stat_statements`, logs | Implementado |
+| R3.5b | Timeouts de conexión | `POOL_TIMEOUT`, gauges del pool | Implementado |
+| R3.5c | Deadlocks | SQLSTATE `40P01`, `log_lock_waits`, reintentos | Implementado |
+| R3.5d | Acciones inmediatas | Sección 5.4 | Diseño (runbook) |
+| R3.6a | Estructura del post mortem | Sección 6.2 | Diseño |
+| R3.6b | Escalamiento | Sección 6.1 | Diseño |
+| R3.6c | Prevención en infraestructura | Sección 6.2 (acciones 3, 4, 5, 6, 8) | Diseño |
+| R3.6d | Prevención en código | Sección 6.2 (implementadas + acciones 1, 2, 7) | Parcial |
+| RNF-1 | 10.000 TPS | Sección 1.3 | Diseño (no medido en el MVP) |
+| RNF-2 | Transferencia < 2 s | Transferencia sin dependencias externas en el camino crítico; timeouts de 2 s (lock) y 5 s (sentencia, pool); métrica p95 | Parcial (mecanismos implementados; sin prueba de carga versionada) |
+| RNF-3 | La IA no bloquea | Outbox + cola (sección 2.1, sección 3) | Implementado |
+| RNF-4 | Bancs sin alto volumen directo | Cola durable implementada; worker con rate limiting y CDC en diseño | Parcial |
+| RNF-5 | Stack justificado | Secciones 1.2 y 1.4 | Diseño (documento) |

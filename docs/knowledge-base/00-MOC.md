@@ -5,9 +5,9 @@ estado: borrador
 
 # SmartBancs – Mapa de contenido
 
-Bóveda de investigación del reto técnico TCS "SmartBancs App". Se construyó **antes** de escribir código, para que las decisiones del MVP salgan de requisitos y referencias trazables.
+Bóveda de investigación del reto técnico TCS "SmartBancs App". Se construyó **después** de la primera versión del MVP, para contrastarlo contra requisitos y referencias trazables (ver [análisis de brechas](../ANALISIS_BRECHAS.md)).
 
-**Proceso:** 1) bóveda → 2) RAG local (`tools/kb-rag`) → 3) retrieve + análisis de brechas + ADR → 4) MVP → 5) revisión con agentes + diagramas.
+**Proceso:** 0) MVP v1 → 1) bóveda → 2) RAG local (`tools/kb-rag`) → 3) retrieve + análisis de brechas → 4) correcciones del MVP por brecha → 5) revisión con equipo de agentes ([informes](../revision/README.md)) + [diagramas](../ARQUITECTURA_DIAGRAMAS.md).
 
 ## Requisitos
 - [[Reto TCS - Checklist]]: requisitos R3.1a–R3.6d, RNF-1–5 y E1–E6. Contra esta nota se compara todo.
@@ -38,7 +38,7 @@ El mapeo exacto está en el frontmatter `requisitos:` de cada nota. Es la fuente
 4. **Operación:** [[Observabilidad]] → [[Incidentes y Post Mortem]]
 
 ## Decisiones
-- `03-Decisiones/`: ADR (fase 3).
+- `03-Decisiones/`: carpeta prevista para ADR; todavía no tiene ninguno.
 
 ## Evidencias
 - `04-Evidencias/retrieval-smoke-test.md`: prueba del RAG con una consulta por requisito.

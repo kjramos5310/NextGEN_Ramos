@@ -15,41 +15,43 @@ Leyenda: **✅** cumple · **⚠️** parcial · **❌** brecha.
 
 ## 1. Resumen por requisito
 
-| Req | Estado | Evidencia en el código |
-|---|---|---|
-| R3.1a Endpoint transaccional | ✅ | `backend/src/modules/transactions/transactions.controller.ts` |
-| R3.1b DDL | ✅ | `backend/sql/schema.sql` (CHECK de saldo ≥ 0, `NUMERIC(18,2)`, índices) |
-| R3.1c DML semilla | ✅ | `backend/sql/seed.sql`, `backend/src/database/seeds/seed.service.ts` |
-| R3.1d Interacción real con BD | ✅ | TypeORM + `queryRunner` en `transactions.service.ts` |
-| R3.1e Concurrencia sin race conditions | ⚠️ | Lock pesimista ordenado (`transactions.service.ts:50-70`), pero sin prueba automatizada de concurrencia (ver **G4**) |
-| R3.1f IaC un comando | ✅ | `docker-compose.yml` (7 servicios, healthchecks, `depends_on`) |
-| R3.2a/b Estrategia Bancs | ⚠️ | Documentada; el patrón Outbox está **declarado pero no implementado** (ver **G1**) |
-| R3.2c–f ETL | ✅ | `etl-bancs/etl_bancs_processor.py` (nulos, fechas, feature engineering, salida JSON) |
-| R3.3a Servicio IA independiente | ✅ | `ai-service/` (FastAPI + consumidor RabbitMQ) |
-| R3.3b/c Consumo asíncrono | ⚠️ | No bloqueante (`transactions.service.ts:132`), pero con riesgo de pérdida de evento (**G1**) |
-| R3.3d–f MLOps teórico | ✅ | `docs/IA_IMPLEMENTACION_Y_DESPLIEGUE.md` |
-| R3.4a–c Logs críticos | ✅ | `common/logger/logger.service.ts`, interceptor de logging |
-| R3.4d Log de interacciones con BD | ⚠️ | `DB_LOGGING` está en `false` por defecto (`app.module.ts:40`); no hay log de consultas lentas (**G7**) |
-| R3.4e–g Métricas | ✅ | `metrics.service.ts`: contador e histograma de transacciones, HTTP, deadlocks, latencia de IA |
-| R3.4h Trazabilidad | ✅ | `x-correlation-id` en middleware, en el payload de RabbitMQ y en `ai-service/consumer.py:19,33` |
-| R3.4i/j Diseño teórico | ✅ | `docs/DOCUMENTO_TECNICO.md` §4.2 |
-| R3.5a Consulta exacta del cuello de botella | ❌ | No hay `pg_stat_statements` ni `auto_explain` (**G7**) |
-| R3.5b Timeouts de BD | ⚠️ | Hay `connectionTimeoutMillis`, pero falta `statement_timeout`/`lock_timeout` (**G3**) |
-| R3.5c Deadlocks | ⚠️ | Se detectan comparando texto del mensaje (`transactions.service.ts:141`) en vez del código SQLSTATE (**G3**) |
-| R3.5d / R3.6a–d Teórico | ✅ | `docs/DOCUMENTO_TECNICO.md` §5-6 |
-| RNF-1 10k TPS | ⚠️ | Pool configurado (`max` 25-30), sin PgBouncer ni prueba de carga que lo respalde (**G5**) |
-| RNF-2 < 2 s | ✅ | Medido por histograma; `execution_time_ms` persistido |
-| RNF-3 IA no bloquea | ✅ | Despacho sin `await` bloqueante |
-| RNF-4 Bancs sin alto volumen | ⚠️ | Solo se publica el evento; no hay rate limiting ni buffer reales (**G1**, **G8**) |
-| E1–E3, E5 | ✅ | `docs/`, `README.md`, `AI_DISCLOSURE.md` |
-| E4 Video y presentación | ❌ | No están en el repo (**G9**) |
+La columna "Antes" es la foto del MVP v1 cuando se hizo este análisis; las referencias `archivo:línea` de esa columna y de la sección 2 apuntan a esa versión, no al código actual. La columna "Ahora" resume el estado después de las correcciones de la sección 4 y de la segunda revisión (sección 5).
+
+| Req | Antes | Evidencia en el código (MVP v1) | Ahora |
+|---|---|---|---|
+| R3.1a Endpoint transaccional | ✅ | `backend/src/modules/transactions/transactions.controller.ts` | ✅ con `Idempotency-Key` y validación de montos (máx. 2 decimales) |
+| R3.1b DDL | ✅ | `backend/sql/schema.sql` (CHECK de saldo ≥ 0, `NUMERIC(18,2)`, índices) | ✅ + `outbox_events` e índice único de idempotencia |
+| R3.1c DML semilla | ✅ | `backend/sql/seed.sql`, `backend/src/database/seeds/seed.service.ts` | ✅ |
+| R3.1d Interacción real con BD | ✅ | TypeORM + `queryRunner` en `transactions.service.ts` | ✅ débito y crédito en `NUMERIC` dentro de PostgreSQL |
+| R3.1e Concurrencia sin race conditions | ⚠️ | Lock pesimista ordenado (`transactions.service.ts:50-70`), pero sin prueba automatizada de concurrencia (ver **G4**) | ✅ `npm run test:int` (12 pruebas contra PostgreSQL real) |
+| R3.1f IaC un comando | ✅ | `docker-compose.yml` (7 servicios, healthchecks, `depends_on`) | ✅ healthchecks en PostgreSQL y RabbitMQ; el backend espera `service_healthy` |
+| R3.2a/b Estrategia Bancs | ⚠️ | Documentada; el patrón Outbox está **declarado pero no implementado** (ver **G1**) | ⚠️ Outbox implementado con *publisher confirms*; el worker hacia Bancs sigue en diseño (**G8**) |
+| R3.2c–f ETL | ✅ | `etl-bancs/etl_bancs_processor.py` (nulos, fechas, feature engineering, salida JSON) | ✅ |
+| R3.3a Servicio IA independiente | ✅ | `ai-service/` (FastAPI + consumidor RabbitMQ) | ✅ |
+| R3.3b/c Consumo asíncrono | ⚠️ | No bloqueante (`transactions.service.ts:132`), pero con riesgo de pérdida de evento (**G1**) | ✅ outbox + ack solo tras persistir, 3 intentos y DLQ `smartbancs.ai.dlq` |
+| R3.3d–f MLOps teórico | ✅ | `docs/IA_IMPLEMENTACION_Y_DESPLIEGUE.md` | ✅ (diseño) |
+| R3.4a–c Logs críticos | ✅ | `common/logger/logger.service.ts`, interceptor de logging | ✅ JSON en producción; ai-service con `corrId`/`txId`/`eventId` en cada línea |
+| R3.4d Log de interacciones con BD | ⚠️ | `DB_LOGGING` está en `false` por defecto (`app.module.ts:40`); no hay log de consultas lentas (**G7**) | ✅ `log_min_duration_statement`, `log_lock_waits` y SQLSTATE + consulta en el log de error |
+| R3.4e–g Métricas | ✅ | `metrics.service.ts`: contador e histograma de transacciones, HTTP, deadlocks, latencia de IA | ✅ la latencia de IA se registra desde `metadata.inferenceLatencyMs` |
+| R3.4h Trazabilidad | ✅ | `x-correlation-id` en middleware, en el payload de RabbitMQ y en `ai-service/consumer.py:19,33` | ✅ el correlation ID se valida (≤ 64 caracteres) |
+| R3.4i/j Diseño teórico | ✅ | `docs/DOCUMENTO_TECNICO.md` §4.2 | ✅ (alertas propuestas, no configuradas en Prometheus) |
+| R3.5a Consulta exacta del cuello de botella | ❌ | No hay `pg_stat_statements` ni `auto_explain` (**G7**) | ✅ `pg_stat_statements` y `db-diagnostics` con `pg_blocking_pids` |
+| R3.5b Timeouts de BD | ⚠️ | Hay `connectionTimeoutMillis`, pero falta `statement_timeout`/`lock_timeout` (**G3**) | ✅ `lock_timeout`, `statement_timeout` y `POOL_TIMEOUT` → 503 |
+| R3.5c Deadlocks | ⚠️ | Se detectan comparando texto del mensaje (`transactions.service.ts:141`) en vez del código SQLSTATE (**G3**) | ✅ por SQLSTATE, con reintento |
+| R3.5d / R3.6a–d Teórico | ✅ | `docs/DOCUMENTO_TECNICO.md` §5-6 | ✅ |
+| RNF-1 10k TPS | ⚠️ | Pool configurado (`max` 25-30), sin PgBouncer ni prueba de carga que lo respalde (**G5**) | ⚠️ sin cambios (**G5**) |
+| RNF-2 < 2 s | ✅ | Medido por histograma; `execution_time_ms` persistido | ✅ medido; sin prueba de carga versionada |
+| RNF-3 IA no bloquea | ✅ | Despacho sin `await` bloqueante | ✅ la petición no toca RabbitMQ: responde tras el `COMMIT` |
+| RNF-4 Bancs sin alto volumen | ⚠️ | Solo se publica el evento; no hay rate limiting ni buffer reales (**G1**, **G8**) | ⚠️ cola durable sin consumidor (**G8**) |
+| E1–E3, E5 | ✅ | `docs/`, `README.md`, `AI_DISCLOSURE.md` | ✅ |
+| E4 Video y presentación | ❌ | No están en el repo (**G9**) | ⚠️ datos de prueba documentados en el README; video y presentación pendientes (**G9**) |
 
 ## 2. Brechas priorizadas
 
 ### G1 — El "Transactional Outbox" está documentado pero no existe (dual-write)
 - **Referencia:** [[Transactional Outbox]] — *"messages are guaranteed to be sent if and only if the database transaction commits"* (microservices.io).
 - **Código:** `transactions.service.ts:132` llama a `dispatchAsyncEvents` **después** de `commitTransaction()`; `dispatchAsyncEvents` (`:162`) publica directo a RabbitMQ. No existe tabla `outbox` en `backend/sql/schema.sql`.
-- **Impacto:** si el proceso o RabbitMQ caen entre el commit y la publicación, el evento se pierde de forma silenciosa. La transferencia queda registrada, pero Bancs nunca se entera. Además, el documento técnico y el guion afirman que se usa Outbox, así que hoy hay una inconsistencia entre lo que se dice y lo que se hace.
+- **Impacto:** si el proceso o RabbitMQ caen entre el commit y la publicación, el evento se pierde de forma silenciosa. La transferencia queda registrada, pero Bancs nunca se entera. Además, el documento técnico afirmaba que se usaba Outbox, así que en ese momento había una inconsistencia entre lo que se decía y lo que se hacía.
 - **Acción:** tabla `outbox_events` insertada dentro de la misma transacción, más un relay con `SELECT ... FOR UPDATE SKIP LOCKED` que publique y marque `published_at`.
 - **Prioridad: alta.** Es la pregunta más probable del jurado.
 
@@ -94,15 +96,15 @@ Leyenda: **✅** cumple · **⚠️** parcial · **❌** brecha.
 - **Acción:** un consumidor mock de Bancs con límite de tasa y DLQ ya demuestra el patrón completo, y es poco código.
 - **Prioridad: media.**
 
+### G9 — Faltan evidencias E4
+- Video demostrativo, material de presentación y datos de prueba.
+- **Prioridad: alta**, porque es un entregable explícito del reto.
+
 ### G10 — La métrica de conexiones del pool nunca se actualizaba (detectada durante la corrección)
 - **Referencia:** [[Connection Pooling y 10k TPS]], [[Observabilidad]] (R3.5b).
 - **Código:** `smartbancs_db_active_connections` se declaraba en `metrics.service.ts`, pero ningún código le asignaba valor: siempre valía 0, y la alerta `ConnectionPoolExhaustion` del documento técnico nunca podía dispararse.
 - **Acción:** leer `totalCount`, `idleCount` y `waitingCount` del pool de `pg` en cada scrape y exponer también `smartbancs_db_pool_waiting_requests`.
 - **Prioridad: media.**
-
-### G9 — Faltan evidencias E4
-- Video demostrativo, material de presentación y datos de prueba.
-- **Prioridad: alta**, porque es un entregable explícito del reto.
 
 ## 3. Orden sugerido de ejecución
 1. G1, G2, G3 y G4, que son el núcleo técnico y lo que el jurado va a cuestionar.
@@ -110,20 +112,34 @@ Leyenda: **✅** cumple · **⚠️** parcial · **❌** brecha.
 3. G5 y G6, que se pueden resolver con configuración y una justificación escrita.
 4. G9: video y presentación.
 
-Cada corrección va en su propio commit, con el ID de la brecha en el mensaje (`fix(G1): ...`).
+Cada corrección se hizo en commits con el ID de la brecha en el mensaje (`fix(G1,G2,G3,G6): ...`, `test(G4): ...`). G1, G2, G3 y G6 van en un mismo commit porque están acopladas en `transactions.service.ts`.
 
 ## 4. Estado de las correcciones
 
 | Brecha | Estado | Commit |
 |---|---|---|
-| G1 Outbox transaccional | ✅ Corregida: tabla `outbox_events` + relay `SKIP LOCKED`; consumidor de recomendaciones idempotente | `fix(G1,G2,G3,G6)` |
-| G2 Idempotency-Key | ✅ Corregida en API y frontend | `fix(G1,G2,G3,G6)`, `feat(G2)` |
-| G3 Deadlocks y timeouts | ✅ Corregida: SQLSTATE, `lock_timeout`, `statement_timeout`, reintento con backoff | `fix(G1,G2,G3,G6)` |
-| G4 Prueba de concurrencia | ✅ `npm run test:int` (4 escenarios contra PostgreSQL real; falla si se quita el lock) | `test(G4)` |
+| G1 Outbox transaccional | ✅ Corregida: tabla `outbox_events` + relay `SKIP LOCKED`; consumidor de recomendaciones idempotente. En la segunda revisión: *publisher confirms*, reconexión indefinida y DLQ del consumidor de IA | `fix(G1,G2,G3,G6)`, `fix(review)`, `fix(ai-service)` |
+| G2 Idempotency-Key | ✅ Corregida en API y frontend. En la segunda revisión: CORS permite el header (antes el navegador bloqueaba la transferencia) y la misma clave con otro payload responde 422 | `fix(G1,G2,G3,G6)`, `feat(G2)`, `fix(review)` |
+| G3 Deadlocks y timeouts | ✅ Corregida: SQLSTATE, `lock_timeout`, `statement_timeout`, reintento con backoff. En la segunda revisión: el pool agotado se clasifica como `POOL_TIMEOUT` y responde 503 | `fix(G1,G2,G3,G6)`, `fix(review)` |
+| G4 Prueba de concurrencia | ✅ `npm run test:int`: 4 escenarios iniciales contra PostgreSQL real (falla si se quita el lock), ampliados a 12 en la segunda revisión (montos al centavo, idempotencia estricta, pool agotado, relay con confirmaciones) | `test(G4)`, `fix(review)` |
 | G5 10k TPS | ⏳ Pendiente: PgBouncer documentado como acción preventiva | — |
-| G6 `synchronize` | ✅ Corregida | `fix(G1,G2,G3,G6)` |
-| G7 Consulta exacta | ✅ `pg_stat_statements`, `log_lock_waits`, runbook en `sql/00-observability.sql` | `feat(G7)` |
-| G8 Ritmo hacia Bancs | ⏳ Parcial: el evento sale del outbox a una cola durable; el worker con rate limiting queda diseñado | — |
-| G9 Video y presentación | ⏳ Pendiente | — |
+| G6 `synchronize` | ✅ Corregida. En la segunda revisión también `backend/.env.example` pasó a `DB_SYNCHRONIZE=false` | `fix(G1,G2,G3,G6)`, `fix(review)` |
+| G7 Consulta exacta | ✅ `pg_stat_statements`, `log_lock_waits`, runbook en `sql/00-observability.sql`. En la segunda revisión: `db-diagnostics` usa `pg_blocking_pids` y solo se habilita con `SIMULATION_ENABLED=true` | `feat(G7)`, `fix(review)` |
+| G8 Ritmo hacia Bancs | ⏳ Parcial: el evento sale del outbox a una cola durable; el worker con rate limiting queda diseñado. La DLQ implementada es la de la cola de IA, no la de Bancs | — |
+| G9 Video y presentación | ⏳ Pendiente. Los datos de prueba ya están descritos en el README | — |
 | G10 Métrica del pool | ✅ Corregida | `fix(G10)` |
 
+`fix(review)` y `fix(ai-service)` abrevian los commits `fix(review): correcciones del backend…` y `fix(ai-service): sin perdida de mensajes…` de la segunda revisión.
+
+## 5. Segunda revisión con equipo de agentes
+
+Con las brechas G1–G10 atendidas, un equipo de agentes de Claude Code revisó el repositorio completo con cuatro roles: concurrencia y base de datos, SRE y observabilidad, coherencia entre documentación y código, y diagramador. Los informes están en [docs/revision/](revision/README.md) y describen el código **antes** de la ronda de correcciones que vino después.
+
+Hallazgos de severidad ALTA y su resolución:
+
+- **Dinero y concurrencia:** montos con más de 2 decimales creaban un centavo por operación (C1), el relay marcaba eventos como publicados sin confirmación del broker (C4) y `backend/.env.example` activaba `synchronize` (C3). Corregidos con validación del DTO y aritmética en `NUMERIC`, *publisher confirms* y `DB_SYNCHRONIZE=false`.
+- **Demo rota:** CORS bloqueaba el header `Idempotency-Key`, así que ninguna transferencia desde la UI llegaba al backend (C2/D1). Corregido.
+- **Mensajes perdidos:** el ai-service hacía ack aunque el backend fallara (O1) y el backend dejaba de reconectar a RabbitMQ tras unos 15 s (O2). Corregidos con reintentos del POST, DLQ `smartbancs.ai.dlq`, reconexión indefinida con backoff y healthcheck de RabbitMQ.
+- **Documentación y UI:** afirmaciones sin respaldo en el código (UI con valores fijos, motor de IA fijo, modelo Gemini desactualizado en `.env.example`, imagen de arquitectura desactualizada, autoría de las notas). Corregidas en la UI, el README, los diagramas y la declaración de IA; el documento técnico y el de IA se reescriben en la misma ronda.
+
+El estado por hallazgo, los commits y los pendientes conocidos (worker de Bancs, purga del outbox, alertas no configuradas, ADR, video) están en [docs/revision/README.md](revision/README.md). Pruebas después de la ronda: `npm test` 31/31, `npm run test:int` 12/12 y `pytest` 16/16.

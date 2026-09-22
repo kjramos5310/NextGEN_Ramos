@@ -1,161 +1,219 @@
-# 🧠 3.3. Inteligencia Artificial: Implementación, Despliegue y MLOps
+# Inteligencia artificial: implementación, despliegue y MLOps (sección 3.3 del reto)
 
-Este documento detalla en profundidad el cumplimiento de la **Sección 3.3 del Reto Técnico**:
-1. **Integración en código (Práctico):** Microservicio independiente de IA y patrón asíncrono no bloqueante en el backend principal.
-2. **Manejo del modelo (Teórico):** Ciclo de vida MLOps, ingesta continua de datos, monitoreo de *Data Drift* y optimización de recursos.
+Este documento cubre dos cosas:
+
+1. **Integración en código (práctico, R3.3a–c).** Qué está implementado y dónde.
+2. **Manejo del modelo en producción (teórico, R3.3d–f).** Ciclo de vida, *data drift* y gestión de recursos. Es **diseño**: cada punto indica si existe algo en el código o no.
+
+Convención: **Implementado** significa que existe en el repositorio (se cita archivo y función). **Diseño** significa que no está en el código del MVP.
 
 ---
 
-## 1. Integración en Código (Práctico)
+## 1. Integración en código (implementado)
 
-### 1.1. Arquitectura de Desacoplamiento Asíncrono
-Para cumplir con el **SLA de transferencia < 2 segundos**, el flujo transaccional crítico está 100% desacoplado del motor de IA mediante un **Event-Driven Architecture (EDA)** implementado con RabbitMQ:
+### 1.1. Flujo asíncrono de punta a punta
 
 ```mermaid
 sequenceDiagram
     autonumber
-    actor Cliente as 📱 App Cliente / React
-    participant API as ⚡ Backend Core (NestJS)
-    participant DB as 🗄️ PostgreSQL (ACID)
-    participant Broker as 📬 RabbitMQ (Topic Exchange)
-    participant AI as 🧠 AI Service (Python FastAPI)
-
-    participant Relay as 🔁 Outbox Relay (backend)
+    actor Cliente as Cliente (React)
+    participant API as Backend NestJS
+    participant DB as PostgreSQL
+    participant Relay as OutboxRelayService (backend)
+    participant MQ as RabbitMQ
+    participant AI as ai-service (consumer.py)
+    participant G as Gemini API
 
     Cliente->>API: POST /api/v1/transactions (Idempotency-Key, x-correlation-id)
-    Note over API,DB: Una sola transacción ACID (READ COMMITTED + lock_timeout/statement_timeout)
-    API->>DB: SELECT ... FOR UPDATE (cuentas en orden determinista)
-    API->>DB: UPDATE saldos + INSERT transactions
+    Note over API,DB: Una transacción READ COMMITTED con lock_timeout y statement_timeout
+    API->>DB: SELECT ... FOR UPDATE (cuentas en orden) + UPDATE saldos + INSERT transactions
     API->>DB: INSERT outbox_events (transaction.created, bancs.sync)
     API->>DB: COMMIT
-    API-->>Cliente: HTTP 201 Created (la IA no está en el camino crítico)
+    API-->>Cliente: 201 Created (ni la IA ni el broker están en este camino)
 
-    rect rgb(30, 41, 59)
-    Note over Relay,Broker: Fuera del camino crítico, cada 500 ms
-    Relay->>DB: SELECT pendientes FOR UPDATE SKIP LOCKED
-    Relay->>Broker: publish(transaction.created, eventId)
-    Relay->>DB: UPDATE published_at (solo si el broker aceptó)
+    loop cada OUTBOX_POLL_INTERVAL_MS (500 ms en compose)
+        Relay->>DB: SELECT pendientes FOR UPDATE SKIP LOCKED (lote de 100)
+        Relay->>MQ: publish persistente (canal de confirmación)
+        MQ-->>Relay: ack / nack
+        Relay->>DB: UPDATE published_at solo de los confirmados
     end
 
-    Broker->>AI: Consume evento desde smartbancs.ai.queue
-    AI->>AI: Inferencia (Gemini o motor heurístico local)
-    AI->>API: POST /api/v1/recommendations (x-correlation-id)
+    MQ->>AI: smartbancs.ai.queue (prefetch 5, ack manual)
+    AI->>G: generateContent (timeout 10 s), si hay GEMINI_API_KEY
+    G-->>AI: JSON, o error / 429 / timeout -> motor heurístico
+    AI->>API: POST /api/v1/recommendations (x-correlation-id), hasta 3 intentos
     API->>DB: INSERT ai_recommendations (idempotente por transaction_id)
-    AI-->>Broker: basic_ack
+    AI-->>MQ: basic_ack, o basic_nack(requeue=false) -> smartbancs.ai.dlq
 ```
 
-### 1.2. Demostración en el Código del Microservicio Principal (`backend`)
-La transferencia no llama a la IA ni publica en RabbitMQ: escribe el evento en la tabla `outbox_events` **dentro de la misma transacción** y responde en cuanto termina el `COMMIT`. Fragmento de `backend/src/modules/transactions/transactions.service.ts`:
+### 1.2. Lado del backend: por qué la IA no afecta la latencia de la transferencia (R3.3b, R3.3c)
 
-```typescript
-await queryRunner.manager.save(Transaction, createdTx);
+- **La transferencia no llama a la IA ni publica en RabbitMQ.** `TransactionsService` ([transactions.service.ts](../backend/src/modules/transactions/transactions.service.ts)) solo recibe por inyección `DataSource`, el repositorio, `MetricsService`, el logger y `ConfigService`. No tiene cliente de RabbitMQ ni de IA. En `executeTransfer`, los eventos se insertan en `outbox_events` antes del `COMMIT`, dentro de la misma transacción (`buildOutboxEvents`), y la respuesta sale tras el `COMMIT`.
+- **Evidencia automatizada:**
+  - La prueba unitaria [transactions.service.spec.ts](../backend/src/modules/transactions/transactions.service.spec.ts) verifica que los eventos de IA y Bancs se insertan en el outbox antes del `COMMIT`.
+  - Las pruebas de integración ([concurrency.int-spec.ts](../backend/test/concurrency.int-spec.ts)) ejecutan `TransactionsService` sin ningún broker.
+- **Qué no hay:** no hay una medición de carga versionada que compare la latencia con y sin IA. Se puede observar con `smartbancs_transaction_duration_seconds` y con `POST /api/v1/simulation/quincena-spike`.
+- **Relay** ([outbox-relay.service.ts](../backend/src/modules/outbox/outbox-relay.service.ts), `flushBatch`/`drain`):
+  - Lee con `FOR UPDATE SKIP LOCKED`, así que es seguro con varias réplicas.
+  - Publica el lote por un `ConfirmChannel`.
+  - Marca `published_at` solo en los mensajes que el broker confirmó (`ack`). Los demás quedan pendientes, con `attempts` incrementado y `last_error`.
+  - `RabbitMQService.publishEvent` ([rabbitmq.service.ts](../backend/src/modules/rabbitmq/rabbitmq.service.ts)) resuelve `false` ante nack, error, timeout de confirmación (`RABBITMQ_CONFIRM_TIMEOUT_MS`, 5 s por defecto) o falta de conexión.
+  - La reconexión al broker es indefinida, con backoff exponencial y tope de 30 s.
+  - Cada mensaje lleva `eventId` (en el body y como `messageId`) y el `correlationId`.
+- **Topología:**
+  - Exchange topic `smartbancs.events`.
+  - `smartbancs.ai.queue` (binding `transaction.created`), durable, con `x-dead-letter-exchange: smartbancs.dlx` y `x-dead-letter-routing-key: smartbancs.ai.dlq`.
+  - DLQ `smartbancs.ai.dlq`.
+  - El backend (`assertTopology`) y el ai-service (`declare_topology`) la declaran con los mismos argumentos. La prueba `test_topology_matches_backend_contract` lo verifica.
+- **Garantía:** *at-least-once*. Si el relay publica y el `UPDATE` falla, el lote se vuelve a publicar. El backend deduplica la recomendación por `transaction_id`.
 
-// TRANSACTIONAL OUTBOX: los eventos se escriben en la MISMA transacción.
-// Si hay rollback no existen; si RabbitMQ está caído esperan en la tabla. No hay dual-write.
-await queryRunner.manager.insert(OutboxEvent, this.buildOutboxEvents(createdTx, sourceAccount, correlationId));
+### 1.3. Microservicio de IA (`ai-service/`, R3.3a)
 
-await queryRunner.commitTransaction();
-return createdTx; // la IA y Bancs se alimentan del outbox, fuera del camino crítico
-```
+**Consumidor** ([consumer.py](../ai-service/consumer.py), `process_transaction_event`):
 
-El relay (`backend/src/modules/outbox/outbox-relay.service.ts`) publica en segundo plano:
+- Usa `pika.BlockingConnection`, `basic_qos(prefetch_count=5)` y ack manual. Procesa **en serie** en un hilo; para ganar paralelismo se agregan réplicas.
+- Si el mensaje no es JSON válido, o le falta `data` o `data.accountNumber`, hace `basic_nack(requeue=False)` y el mensaje va a la DLQ sin reintento.
+- Ejecuta la inferencia y mide su latencia (`inference_latency_ms`).
+- Hace el `POST /api/v1/recommendations` al backend (`post_recommendation_with_retries`) con el header `x-correlation-id` y `metadata` que incluye `engine`, `inferenceLatencyMs` y `eventId`:
+  - 2xx o 409: `basic_ack`.
+  - Timeout (5 s), error de conexión o 5xx: hasta 3 intentos en total, con esperas de 0.5 s y 1 s. Las esperas usan `time.sleep` y bloquean el consumidor mientras tanto.
+  - 4xx distinto de 409: sin reintento.
+  - Con reintentos agotados, 4xx o una excepción inesperada: `basic_nack(requeue=False)` → `smartbancs.ai.dlq`.
+- Si pierde la conexión con RabbitMQ, reconecta cada 5 s.
+- **Límite actual:** la DLQ no tiene consumidor ni reproceso automático. Los mensajes se revisan y se reinyectan a mano (UI de RabbitMQ o shovel). Un reprocesador con límite de reintentos es diseño.
 
-```typescript
-const rows = await qr.query(
-  `SELECT id, event_type, payload, correlation_id FROM outbox_events
-    WHERE published_at IS NULL ORDER BY created_at LIMIT $1
-    FOR UPDATE SKIP LOCKED`, [this.batchSize]);
+**Motor de inferencia** ([advisor.py](../ai-service/advisor.py), `FinancialAdvisorModel.analyze_transaction`):
 
-for (const row of rows) {
-  const ok = await this.rabbitmqService.publishEvent(row.event_type, { eventId: row.id, ...row.payload }, row.correlation_id);
-  if (!ok) break;                       // broker caído: el evento sigue pendiente, no se pierde
-  await qr.query(`UPDATE outbox_events SET published_at = now() WHERE id = $1`, [row.id]);
-}
-```
+- **Gemini**, si `GEMINI_API_KEY` está definida:
+  - `POST https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent`, con la key en el header `x-goog-api-key`.
+  - `GEMINI_MODEL` vale por defecto `gemini-2.5-flash` (también en [docker-compose.yml](../docker-compose.yml) y [.env.example](../.env.example)).
+  - La petición lleva `systemInstruction` y `generationConfig` con `responseMimeType: "application/json"`, `temperature: 0.2`, `maxOutputTokens: 800` y `thinkingConfig.thinkingBudget: 0`. Timeout HTTP: 10 s (`GEMINI_TIMEOUT_SECONDS`).
+- **Parseo** (`_clean_and_parse_json`): quita los delimitadores de markdown; si falla, extrae el primer bloque `{...}` con una expresión regular.
+- **Validación del contrato** (`_validate_gemini_result`):
+  - `type` debe pertenecer al enum de PostgreSQL y `message` no puede estar vacío.
+  - `title` se recorta a 150 caracteres (tamaño de la columna) y `confidenceScore` se acota a [0, 1].
+  - Si la respuesta no cumple, se usa el fallback.
+- **Motor heurístico local** (`_heuristic_rule_fallback`): reglas deterministas por categoría y monto, sin red. Se usa cuando no hay key y cuando Gemini responde con error HTTP, 429, timeout, JSON inválido o un contrato inválido.
+- Cada recomendación lleva `engine`: el nombre del modelo de Gemini o `heuristic-fallback`. Es la fuente de verdad de qué motor respondió.
+- **Coste por evento con Gemini degradado:** no hay circuit breaker. Si Gemini está caído o lento, cada evento puede esperar hasta 10 s antes de caer al fallback, y eso limita el ritmo del consumidor. El circuit breaker es diseño (sección 2.3).
 
-**Por qué así y no "fire-and-forget":** publicar después del `COMMIT` sin outbox es un *dual-write*: si el proceso o RabbitMQ caen entre ambos pasos, la transferencia existe pero la IA y Bancs nunca se enteran. Con el outbox la garantía es que el evento se publica si y solo si la transacción se confirmó. La prueba `backend/test/concurrency.int-spec.ts` lo verifica con el broker caído y luego recuperado.
+**Endpoints** ([main.py](../ai-service/main.py)):
 
-### 1.3. Microservicio Independiente de IA (`ai-service`): Integración Gemini + Fallback
-Ubicado en [`ai-service/`](../ai-service), implementado en **Python FastAPI** con consumidor asíncrono [`consumer.py`](../ai-service/consumer.py) y motor de inferencia [`advisor.py`](../ai-service/advisor.py):
-- **Consumo Real de Google Gemini API:** Mediante la variable de entorno `GEMINI_API_KEY`, invoca el modelo generativo de Google configurado en la variable `GEMINI_MODEL` con salidas estructuradas en JSON estricto (`responseMimeType: "application/json"`).
-- **Parser Resiliente de Doble Capa (*Self-Healing JSON*):**  
-  Implementado en `advisor.py`, asegura que las respuestas del LLM no interrumpan el flujo transaccional:
-  - *Capa 1:* Sanitización y remoción de etiquetas markdown (` ```json ... ``` `).
-  - *Capa 2:* Fallback extractivo mediante RegEx balanceado (`\{[\s\S]*\}`) para aislar el objeto JSON puro.
-- **Motor de Fallback Heurístico Local (Zero-Downtime):** Si la clave no está configurada, o ante problemas de conectividad o límites de cuota (HTTP 429), el servicio degrada con gracia hacia el motor heurístico local, manteniendo disponibilidad al 100%.
-- **Aislamiento de Recursos:** Se ejecuta en su propio runtime y contenedor Docker, evitando que el cómputo de inferencia consuma memoria o CPU del backend transaccional.
-- **Worker Concurrente con Prefetch:** El consumidor `pika` utiliza `basic_qos(prefetch_count=5)` para procesar eventos a demanda sin saturar el proceso.
-- **Endpoint Directo de Inferencia:** Expone `POST /predict-recommendation`, `GET /health` y `GET /model-info` para consultas sincrónicas bajo demanda y observabilidad de MLOps.
+- `GET /health`:
+  - `status` vale `UP` o `DEGRADED` (este último si el hilo consumidor no está conectado a RabbitMQ).
+  - Devuelve `geminiApiKeyConfigured`, `configuredPrimaryEngine`, los contadores de inferencias (total, Gemini, fallback) y el estado del consumidor (`connected`, `lastMessageAt`, `messagesAcked`, `messagesDeadLettered`).
+- `GET /model-info`:
+  - `modelVersion: "v2.5.0-gemini-hybrid"`, `serviceVersion: "2.5.0"`, motor primario y de fallback, timeout, categorías, tipos, colas y contadores.
+  - `dataDriftStatus: "not_implemented"`, y `dataDriftScore`, `confidenceThreshold` y `trainingBatchVersion` en `null`: no se reportan valores inventados.
+- `POST /predict-recommendation`: inferencia síncrona bajo demanda, para pruebas. El backend no lo usa.
+
+**Backend receptor** ([recommendations.service.ts](../backend/src/modules/recommendations/recommendations.service.ts), `create`):
+
+- Observa `smartbancs_ai_recommendation_duration_seconds{engine}` a partir de `metadata.inferenceLatencyMs`.
+- Deduplica por `transaction_id`: comprueba antes de insertar, tiene el índice único `uq_ai_recs_transaction` y, ante `23505`, devuelve la recomendación existente.
+- **Limitación:** el endpoint no tiene DTO de validación ni autenticación (ver [DOCUMENTO_TECNICO.md](DOCUMENTO_TECNICO.md) §1.4).
+
+**Aislamiento:** proceso y contenedor propios (`python:3.11-slim`, un proceso `uvicorn`). La inferencia no comparte event loop ni memoria con el backend. **No hay límites de CPU ni de memoria declarados** en `docker-compose.yml`.
+
+### 1.4. Cómo verificar la API key de Gemini
+
+1. Copiar `.env.example` a `.env` en la raíz y definir `GEMINI_API_KEY`. `GEMINI_MODEL` ya viene en `gemini-2.5-flash`. Sin key, todo funciona con el motor heurístico.
+2. Ejecutar `python ai-service/scripts/check_gemini.py` desde la raíz, con las dependencias de `ai-service/requirements.txt` instaladas. El script ([check_gemini.py](../ai-service/scripts/check_gemini.py)):
+   - Carga `.env`.
+   - Imprime el modelo y **solo la longitud** de la key.
+   - Hace una inferencia real con `advisor._call_gemini_api`.
+   - Imprime `OK: respondió Gemini en N ms` con `engine`, `type`, `title` y `message`, o termina con `FALLO` y el motivo en el log `[GEMINI-API]`.
+3. **Con el sistema levantado**, hay tres comprobaciones:
+   - `GET http://localhost:8000/health` debe mostrar `geminiApiKeyConfigured: true` y el contador `geminiInferences` debe crecer.
+   - Cada recomendación guardada trae `metadata.engine`.
+   - En Prometheus, la serie `smartbancs_ai_recommendation_duration_seconds_count{engine="gemini"}` debe crecer.
+
+### 1.5. Observabilidad de la IA (implementado)
+
+- **Métrica en Prometheus:** solo `smartbancs_ai_recommendation_duration_seconds{engine="gemini"|"heuristic"|"unknown"}`. La expone el **backend**, a partir de la latencia que reporta el ai-service. Cuenta también los reenvíos duplicados. Ejemplo de p95 por motor: `histogram_quantile(0.95, sum by (le, engine) (rate(smartbancs_ai_recommendation_duration_seconds_bucket[5m])))`.
+- **El ai-service no expone `/metrics`** y Prometheus no lo scrapea. Sus contadores están en memoria (`/health`, `/model-info`) y se reinician con el proceso.
+- **Logs** ([log_context.py](../ai-service/log_context.py)): son texto, no JSON. Cada línea que se emite mientras se procesa un evento lleva `corrId`, `txId` y `eventId`. Hay registros de la llamada a Gemini (latencia, 429, timeout, respuesta inválida), del uso del fallback, del POST al backend y de los envíos a la DLQ.
+- **Pruebas** ([test_consumer.py](../ai-service/tests/test_consumer.py), 16 pruebas con `pytest`):
+  - ack con 2xx y con 409.
+  - Reintentos ante 503.
+  - DLQ tras 3 fallos, ante 4xx y ante un mensaje inválido.
+  - Payload y header de correlación.
+  - Contexto de logs.
+  - Contrato de topología.
+  - Fallback ante un `type` inválido y ante timeout de Gemini.
+  - `/model-info` sin valores inventados.
 
 ---
 
-## 2. Manejo del Modelo en Producción (Teórico - MLOps)
+## 2. Manejo del modelo en producción (diseño, R3.3d–f)
 
-### 2.1. Ciclo de Vida del Modelo (Model Lifecycle & Continuous Training)
-El ciclo de vida del modelo de recomendación financiera sigue el estándar **MLOps CI/CD/CT (Continuous Integration, Continuous Delivery, Continuous Training)**:
+**Punto de partida real.** El "modelo" del MVP es un LLM alojado (Gemini) más un motor de reglas. **No hay un modelo entrenado por SmartBancs**, ni registro de modelos, ni pipeline de reentrenamiento. Lo que sigue describe cómo se gestionaría en producción.
+
+### 2.1. Ciclo de vida y alimentación con datos nuevos (R3.3d)
 
 ```
-+------------------+      +-------------------+      +--------------------+
-| Ingesta ETL      | ---> | Feature Store     | ---> | Pipeline de        |
-| (Bancs + Core)   |      | (PostgreSQL /     |      | Reentrenamiento    |
-|                  |      | Feast)            |      | (Airflow / Kubeflow|
-+------------------+      +-------------------+      +---------+----------+
-                                                               |
-+------------------+      +-------------------+                |
-| Inferencia       | <--- | Model Registry    | <--------------+
-| en Producción    |      | (MLflow / S3)     |
-| (FastAPI Worker) |      | Versión Promovida |
-+--------+---------+      +-------------------+
-         |
-         v
-+------------------+
-| Monitoreo        |
-| Data Drift / PSI |
-+------------------+
+ETL diario (Bancs + SmartBancs) -> datos anonimizados -> Feature store
+        -> evaluación offline (conjunto de referencia) -> registro de versión
+        -> despliegue shadow / canary -> producción -> monitoreo (drift, calidad) -> vuelta al inicio
 ```
 
-1. **Alimentación Continua con Nuevos Datos:**
-   - El pipeline ETL diario ([`etl_bancs_processor.py`](../etl-bancs/etl_bancs_processor.py)) extrae las transacciones consolidadas de Bancs y SmartBancs.
-   - Las transacciones son limpiadas, anonimizadas (cumplimiento regulatorio PCI-DSS y GDPR) y enriquecidas con variables de comportamiento (`logAmount`, `channelRiskScore`, frecuencia semanal).
-   - Se almacenan en el **Feature Store**, permitiendo que el entrenamiento utilice datos históricos consistentes.
+1. **Ingesta.**
+   - **Hoy existe:** [etl_bancs_processor.py](../etl-bancs/etl_bancs_processor.py). Deduplica, trata nulos, estandariza fechas y monedas, y genera `isHighValue`, `logAmount` y `channelRiskScore` sobre un CSV local. **No anonimiza** y su salida no la consume el ai-service.
+   - **Diseño:** ejecución programada (Airflow o similar) sobre los extractos de Bancs y la tabla `transactions`; hash con sal de los números de cuenta; features de comportamiento (frecuencia y gasto por categoría en ventanas de 7 y 30 días) en un feature store.
+2. **Versionado de lo que define el comportamiento.** Con un LLM alojado, lo que se versiona es el identificador del modelo (`GEMINI_MODEL`), el prompt y la instrucción de sistema, las reglas del fallback y el esquema de salida.
+   - **Hoy existe:** `model_version` (fijo en el código) y `GEMINI_MODEL` (variable de entorno).
+   - **Diseño:** cada combinación se registra como una versión (MLflow o un registro equivalente).
+3. **Evaluación antes de promover (diseño).**
+   - Un conjunto de referencia de transacciones etiquetadas por negocio: tipo de recomendación esperado y casos de fraude.
+   - Métricas: tasa de salida válida (contrato), acuerdo con las etiquetas y latencia p95.
+   - La versión candidata corre en *shadow* (sin mostrarse al cliente) y se compara con la vigente (*champion vs. challenger*) antes de un canary.
+4. **Modelo propio (diseño, opcional).** Si en el futuro se entrena un clasificador propio (p. ej. para fraude o categorización) sobre las features del ETL, el reentrenamiento sería periódico o disparado por drift (sección 2.2). Pasaría por las mismas etapas de evaluación y registro.
 
-2. **Reentrenamiento Automatizado:**
-   - Se ejecutan *training pipelines* periódicos (semanales o quincenales) evaluando modelos candidatos frente al modelo actual en producción (*Champion vs. Challenger*).
-   - Métricas de validación: F1-Score en clasificación de gasto > 0.90 y tasa de falsos positivos en alertas de fraude < 0.5%.
+### 2.2. Monitoreo de *data drift* (R3.3e)
 
-### 2.2. Monitoreo de Data Drift y Concept Drift
+**Implementado:** nada que calcule drift. `/model-info` devuelve `dataDriftStatus: "not_implemented"`. Las únicas señales disponibles hoy son la proporción de `engine="heuristic"` frente a `engine="gemini"` en la métrica del backend y los contadores de `/health`.
 
-En banca, el comportamiento de gasto cambia drásticamente en fechas especiales (quincenas, Black Friday, festividades). Para evitar la degradación del modelo:
+**Diseño:**
 
-1. **Métricas de Drift en Producción:**
-   - **Population Stability Index (PSI):** Se compara la distribución de montos y categorías de los últimos 7 días contra la distribución base de entrenamiento.
-     $$\text{PSI} = \sum \Big( (\% \text{Actual} - \% \text{Esperado}) \times \ln\big(\frac{\% \text{Actual}}{\% \text{Esperado}}\big) \Big)$$
-     - $\text{PSI} < 0.10$: Distribución estable (Sin cambios requeridos).
-     - $0.10 \le \text{PSI} \le 0.25$: Cambio moderado (Alerta preventiva a MLOps).
-     - $\text{PSI} > 0.25$: *Significant Data Drift* $\rightarrow$ **Disparo automático de reentrenamiento**.
-   - **Kolmogorov-Smirnov Test (KS Test):** Para variables continuas de montos transaccionales.
+1. **Drift de entrada (datos).** Un job diario compara la distribución de los últimos 7 días contra una ventana de referencia:
+   - **PSI** (*Population Stability Index*) para variables categorizadas: categoría, canal, deciles de monto.
+     `PSI = Σ (p_actual − p_ref) · ln(p_actual / p_ref)`.
+     Umbrales de referencia habituales:
+     - < 0.10: estable.
+     - 0.10–0.25: cambio moderado; se revisa.
+     - > 0.25: cambio significativo; se evalúa reentrenar o ajustar el prompt o las reglas.
+   - **Prueba de Kolmogorov–Smirnov** para variables continuas (monto, saldo).
+   - La quincena y las fechas especiales se comparan contra la misma fecha de periodos anteriores, para no alertar por estacionalidad esperada.
+2. **Drift de salida y de calidad** (el más útil con un LLM):
+   - Distribución de `type` de recomendación.
+   - Tasa de respuestas inválidas que caen al fallback.
+   - Tasa de 429 y timeouts.
+   - Distribución de `confidenceScore`.
+   - Tasa de mensajes en la DLQ.
+   - Muestreo periódico para revisión humana.
+3. **Dónde se calcula:** offline, sobre `transactions` y `ai_recommendations` (una réplica de lectura), nunca en el camino del consumidor. El resultado se publicaría como métrica (`ai_data_drift_psi{feature}`) y alimentaría `dataDriftStatus` en `/model-info`.
+4. **Acción:** alerta a MLOps → análisis → ajuste de prompt o reglas, o reentrenamiento → evaluación (sección 2.1). No se reentrena de forma automática sin evaluación.
 
-2. **Telemetría MLOps:**
-   - El endpoint `/model-info` reporta en tiempo real la versión activa (`v2.4.0-smartbancs`), total de inferencias procesadas y estado del drift (`NORMAL`).
+### 2.3. Gestión del consumo de recursos (R3.3f)
 
-### 2.3. Gestión del Consumo de Recursos y Escalabilidad
+**Implementado:**
 
-1. **Escalado Horizontal Basado en Colas (KEDA / HPA):**
-   - El microservicio `ai-service` escala réplicas de contenedores utilizando **KEDA (Kubernetes Event-driven Autoscaling)** basado en el tamaño de la cola `smartbancs.ai.queue` en RabbitMQ.
-   - Si la cola supera los 500 mensajes pendientes (ej. pico de quincena), se escalan automáticamente de 2 a 8 pods de inferencia.
+- Contenedor y proceso separados del backend.
+- `prefetch_count=5`, que acota los mensajes en vuelo por consumidor.
+- Timeout de 10 s a Gemini y de 5 s al backend.
+- `maxOutputTokens: 800` y `thinkingBudget: 0`, que acotan tokens y costo por llamada.
+- Fallback local ante 429, sin reintentar contra Gemini.
+- Cola durable como amortiguador: un pico de transferencias se convierte en backlog y no en carga simultánea.
 
-2. **Aislamiento de Recursos (Resource Limits):**
-   - Configuración estricta en Docker/K8s:
-     ```yaml
-     resources:
-       requests:
-         memory: "256Mi"
-         cpu: "250m"
-       limits:
-         memory: "512Mi"
-         cpu: "1000m"
-     ```
-   - Garantiza que picos de inferencia nunca afecten la memoria o CPU de la base de datos PostgreSQL ni del backend NestJS.
+**No implementado:** límites de CPU y memoria del contenedor, autoescalado, control de cuota RPM, circuit breaker y caché.
 
-3. **Inferencia Batch y Caching:**
-   - Perfiles de clientes recurrentes y reglas base son cacheadas en memoria para ejecutar inferencias en **< 5 ms**, minimizando el consumo de CPU.
+**Diseño:**
+
+1. **Límites por contenedor** (Kubernetes `requests`/`limits`, o `deploy.resources` en compose). Se dimensionan midiendo el consumo real bajo la simulación de quincena, no con valores fijados de antemano.
+2. **Autoescalado por cola** (KEDA sobre la profundidad de `smartbancs.ai.queue`), con un mínimo y un máximo de réplicas. El máximo lo fija la cuota de Gemini y la capacidad del backend para recibir los POST, no solo la cola.
+3. **Cuota y costo de Gemini:**
+   - *Token bucket* compartido (p. ej. en Redis) con el RPM contratado.
+   - Circuit breaker: tras N fallos o 429 seguidos, se usa directamente el fallback durante T segundos, lo que evita pagar el timeout de 10 s por evento.
+   - Presupuesto diario de tokens con alerta.
+4. **Priorización:** si hay backlog, se atienden primero los eventos recientes (una recomendación vieja pierde valor) o los de alto monto (posible fraude). Los eventos viejos se pueden procesar solo con el motor heurístico.
+5. **Caché** de perfiles de cliente y de respuestas para patrones repetidos (misma categoría y rango de monto), con TTL corto. Su beneficio se mide antes de adoptarla.

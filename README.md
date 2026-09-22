@@ -1,143 +1,242 @@
-# 🚀 SmartBancs App — NextGen Engineering Technical Challenge
+# SmartBancs App
 
-[![NestJS](https://img.shields.io/badge/Backend-NestJS%2010-E0234E?style=flat&logo=nestjs)](https://nestjs.com/)
-[![React](https://img.shields.io/badge/Frontend-React%2018%20%2B%20Vite-61DAFB?style=flat&logo=react)](https://react.dev/)
-[![PostgreSQL](https://img.shields.io/badge/Database-PostgreSQL%2016-336791?style=flat&logo=postgresql)](https://www.postgresql.org/)
-[![RabbitMQ](https://img.shields.io/badge/Broker-RabbitMQ%203-FF6600?style=flat&logo=rabbitmq)](https://www.rabbitmq.com/)
-[![Python](https://img.shields.io/badge/AI%20%26%20ETL-Python%203.11-3776AB?style=flat&logo=python)](https://www.python.org/)
-[![Prometheus](https://img.shields.io/badge/Observability-Prometheus%20%2B%20Grafana-E6522C?style=flat&logo=prometheus)](https://prometheus.io/)
-[![Docker](https://img.shields.io/badge/IaC-Docker%20Compose-2496ED?style=flat&logo=docker)](https://www.docker.com/)
+Prueba técnica TCS NextGen Engineer. SmartBancs es un MVP de plataforma de transferencias bancarias en tiempo real con tres piezas principales:
 
-> Plataforma bancaria de alta concurrencia diseñada para procesar transacciones en tiempo real con cumplimiento **ACID**, recomendaciones financieras personalizadas impulsadas por **Inteligencia Artificial asíncrona**, integración con el **Core Legado "Bancs"** y observabilidad distribuida.
+- **Transferencias ACID con concurrencia controlada.** Locks pesimistas en orden determinista, `lock_timeout`/`statement_timeout`, reintento ante deadlock, `Idempotency-Key` y montos exactos en `NUMERIC`.
+- **Recomendaciones financieras con IA que no bloquean la transferencia.** Los eventos se guardan en un *Transactional Outbox* dentro de la misma transacción y un relay los publica en RabbitMQ con *publisher confirms*. El `ai-service` los consume y usa Gemini (`gemini-2.5-flash`) o, sin API key o si Gemini falla, un motor heurístico local.
+- **Integración con el core legado "Bancs"**: un evento `bancs.sync` por transferencia en una cola durable (el worker con rate limiting está diseñado, no implementado) y un pipeline ETL en Python que limpia un lote crudo del core.
 
----
+Además incluye observabilidad (logs con `x-correlation-id`, métricas Prometheus y un dashboard de Grafana) y una consola para simular el pico de quincena.
 
-## 🏛️ 1. Arquitectura de la Solución
+El enunciado está en [docs/reto/reto-original.md](docs/reto/reto-original.md).
 
-<p align="center">
-  <img src="docs/Architecture.png" alt="Diagrama de Arquitectura SmartBancs" width="100%" />
-</p>
+## Arquitectura
 
----
+```mermaid
+flowchart LR
+    user(["Navegador"])
+    subgraph compose["docker compose"]
+        fe["frontend<br/>React + nginx :3000"]
+        be["backend<br/>NestJS :4000<br/>relay del outbox"]
+        pg[("PostgreSQL 16 :5432<br/>outbox_events")]
+        mq{{"RabbitMQ :5672<br/>DLQ smartbancs.ai.dlq"}}
+        ai["ai-service<br/>FastAPI :8000"]
+        prom["Prometheus :9090"]
+        graf["Grafana :3001"]
+    end
+    gem["Gemini API<br/>(opcional)"]
+    bancs["Core Bancs<br/>(diseño)"]
+    etl["etl-bancs<br/>script Python"]
 
-## ⚡ 2. Características Principales
+    user --> fe
+    user -->|"REST /api/v1"| be
+    be -->|"transacción + outbox"| pg
+    be -->|"publisher confirms"| mq
+    mq -->|"smartbancs.ai.queue"| ai
+    ai -->|"POST /recommendations"| be
+    ai -.-> gem
+    prom -->|"/metrics"| be
+    graf --> prom
+    mq -.->|"bancs.sync.queue, sin consumidor"| bancs
+    bancs -.->|"CSV"| etl
+```
 
-1. **Cumplimiento Estricto de SLA (< 2s):**
-   - Transacciones procesadas en base de datos en ~15-20 ms.
-   - Los eventos para la IA y para Bancs se guardan en un **Transactional Outbox** dentro de la misma transacción; un relay los publica en RabbitMQ fuera del camino crítico (sin *dual-write*: si el broker cae, los eventos no se pierden).
-   - Header `Idempotency-Key`: un reintento del cliente nunca genera un doble débito.
-2. **Prevención de Condiciones de Carrera (Race Conditions) y Deadlocks:**
-   - Implementación de bloqueo pesimista ordenado (`SELECT ... FOR UPDATE`) ordenando lexicográficamente las cuentas antes de bloquear.
-   - `lock_timeout` / `statement_timeout` por transacción, clasificación de errores por SQLSTATE (`40P01`, `55P03`, `57014`) y reintento con backoff ante deadlock.
-   - Prueba de concurrencia automatizada contra PostgreSQL real (ver sección de pruebas).
-3. **Integración con Core Legado (Bancs):**
-   - *Transactional Outbox* implementado (tabla `outbox_events` + relay con `SKIP LOCKED`); el consumo hacia Bancs con Rate Limiting está diseñado en el documento técnico.
-   - Script ETL en Python (`etl-bancs/etl_bancs_processor.py`) para limpieza, imputación de nulos y *feature engineering* de datos en crudo.
-4. **Microservicio de Inteligencia Artificial:**
-   - Motor de recomendaciones financieras (`ai-service`) con categorización de gastos, alertas de sobrecosto y scoring de inversión en segundo plano.
-5. **Observabilidad Distribuida & Telemetría:**
-   - Trazabilidad E2E mediante `x-correlation-id`.
-   - Métricas de Prometheus (`/metrics`) que miden TPS, latencia (p50/p95/p99) y estados del pool de conexiones.
-   - Dashboards visuales en Grafana.
-6. **Simulador de Incidente de Quincena:**
-   - Consola integrada para disparar ráfagas de 20 a 100 transacciones concurrentes y comprobar la estabilidad de conexiones y ausencia de bloqueos.
+Las líneas discontinuas son opcionales o de diseño. Los diagramas completos están en [docs/ARQUITECTURA_DIAGRAMAS.md](docs/ARQUITECTURA_DIAGRAMAS.md): secuencia de la transferencia, relay y DLQ, modelo de datos, Bancs y ETL, observabilidad y estados del outbox.
 
----
+## Stack
 
-## 🚀 3. Instrucciones de Ejecución (Paso a Paso)
+| Pieza | Tecnología | Por qué |
+|---|---|---|
+| API transaccional | NestJS 10 + TypeORM (Node 20) | Módulos por dominio, validación declarativa de DTOs y control explícito de la transacción con `QueryRunner`. |
+| Base de datos | PostgreSQL 16 | ACID, `SELECT ... FOR UPDATE`, `SKIP LOCKED` para el relay, `NUMERIC(18,2)` y `pg_stat_statements` para diagnosticar. |
+| Mensajería | RabbitMQ 3.13 | Colas durables, *publisher confirms*, ack manual y dead-letter exchange. Suficiente para el volumen del MVP sin operar Kafka. |
+| IA | Python 3.11 + FastAPI + pika | Servicio independiente del backend; si se cae, las transferencias siguen funcionando. |
+| Modelo | Gemini `gemini-2.5-flash` + motor heurístico | Gemini es opcional: sin API key, o si falla, el motor de reglas responde. El motor usado queda en `metadata.engine`. |
+| ETL | Python + pandas | Limpieza y *feature engineering* de un lote tabular con nulos, duplicados y formatos mixtos. |
+| Frontend | React 18 + Vite + Tailwind, servido por nginx | SPA ligera para operar la demo: cuentas, transferencias, recomendaciones y consola de incidentes. |
+| Observabilidad | winston, prom-client, Prometheus, Grafana | Logs con correlation ID (JSON en producción), métricas por SQLSTATE y dashboard provisionado. |
+| Infraestructura | Docker Compose | Un comando levanta los 7 servicios, con healthchecks en PostgreSQL y RabbitMQ. |
 
-### Prerrequisitos
-- [Docker Desktop](https://www.docker.com/) (con soporte para Docker Compose).
+## Prerrequisitos
 
-### Despliegue con un Solo Comando (IaC)
-Clona el repositorio y ejecuta desde la raíz:
+- **Docker Desktop** (o Docker Engine con el plugin Compose). Es lo único necesario para levantar la solución.
+- **Node.js 20 + npm**: solo para las pruebas del backend.
+- **Python 3.11 o superior + pip**: solo para las pruebas del ai-service, el ETL y `check_gemini.py`.
+
+## Configuración
+
+```bash
+cp .env.example .env
+```
+
+- `GEMINI_API_KEY` es **opcional**. Si queda vacía, el ai-service usa el motor heurístico local y todo el flujo funciona igual. Si la pones, compruébala antes de levantar:
+
+  ```bash
+  pip install -r ai-service/requirements.txt
+  python ai-service/scripts/check_gemini.py
+  ```
+
+  El script hace una inferencia real con el código del servicio, dice si respondió Gemini o el motor heurístico y nunca imprime la clave.
+- `docker compose` lee de `.env` solo `GEMINI_API_KEY` y `GEMINI_MODEL` (por defecto `gemini-2.5-flash`). El resto de variables de `.env.example` documenta los valores que el compose ya fija en `docker-compose.yml`.
+- En `docker-compose.yml` el backend arranca con `SIMULATION_ENABLED: "true"` para la demo, lo que habilita `/api/v1/simulation`. Esos endpoints mueven saldos reales; fuera de una demo deben quedar en `false`.
+- Las credenciales del compose (`postgrespassword`, `guest/guest`, `admin/admin`) son solo para uso local.
+
+## Levantar
 
 ```bash
 docker compose up --build
 ```
 
-> Si ya habías levantado una versión anterior, recrea el volumen de la base para que se apliquen las tablas nuevas (`outbox_events`, `idempotency_key`): `docker compose down -v` y luego `docker compose up --build`.
+| Servicio | URL | Nota |
+|---|---|---|
+| Frontend | http://localhost:3000 | Banca digital, feed de IA, consola de incidentes y visor ETL |
+| API del backend | http://localhost:4000/api/v1/accounts | REST; transferencias en `POST /api/v1/transactions` |
+| Métricas del backend | http://localhost:4000/metrics | Formato Prometheus |
+| ai-service | http://localhost:8000/docs | Swagger; estado en `/health` y `/model-info` |
+| RabbitMQ Management | http://localhost:15672 | `guest` / `guest` |
+| Prometheus | http://localhost:9090 | Scrapea el backend cada 5 s |
+| Grafana | http://localhost:3001 | `admin` / `admin`; dashboard "SmartBancs - Core Metrics Overview" |
+| PostgreSQL | `localhost:5432` | `postgres` / `postgrespassword`, base `smartbancs_db` |
 
-### Detener la solución
+## Probar una transferencia
+
+Con el sistema levantado, las cuentas semilla ya existen (ver [Datos de prueba](#datos-de-prueba)).
+
 ```bash
-docker compose down        # detiene los contenedores
-docker compose down -v     # además borra los datos de PostgreSQL
+# 1. Transferencia con Idempotency-Key: responde 201 con la transacción
+curl -i -X POST http://localhost:4000/api/v1/transactions \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: demo-001' \
+  -d '{"sourceAccountNumber":"1000000001","targetAccountNumber":"1000000002","amount":25.50}'
+
+# 2. Mismo comando otra vez: devuelve la MISMA transacción (mismo id) y no debita de nuevo
+
+# 3. Misma clave con otro monto: 422, porque es otro pago y no un reintento
+curl -i -X POST http://localhost:4000/api/v1/transactions \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: demo-001' \
+  -d '{"sourceAccountNumber":"1000000001","targetAccountNumber":"1000000002","amount":99}'
+
+# 4. Monto con más de 2 decimales: 400
+curl -i -X POST http://localhost:4000/api/v1/transactions \
+  -H 'Content-Type: application/json' \
+  -d '{"sourceAccountNumber":"1000000001","targetAccountNumber":"1000000002","amount":0.125}'
+
+# 5. Saldos y recomendación generada por la IA (llega unos segundos después)
+curl http://localhost:4000/api/v1/accounts/1000000001/balance
+curl http://localhost:4000/api/v1/recommendations/account/1000000001
+
+# 6. Métricas: transacciones, errores de BD por SQLSTATE, backlog del outbox y pool
+curl -s http://localhost:4000/metrics | grep -E '^smartbancs_(transactions_total|db_errors_total|outbox_pending_events|db_pool_waiting_requests|ai_recommendation_duration_seconds_count)'
 ```
 
-### Pruebas
+La respuesta lleva el header `x-correlation-id`. Con ese valor puedes seguir la operación en `docker compose logs backend ai-service`. La recomendación guarda en `metadata.engine` qué motor la generó (`gemini-2.5-flash` o `heuristic-fallback`).
+
+En RabbitMQ Management (pestaña *Queues*) se ven `smartbancs.ai.queue`, su DLQ `smartbancs.ai.dlq` y `smartbancs.bancs.sync.queue`, que acumula mensajes porque no tiene consumidor.
+
+## Pruebas
+
+**Backend, unitarias** (31 pruebas, sin dependencias externas):
+
 ```bash
 cd backend
-npm install
-npm test                   # pruebas unitarias
-docker compose up -d postgres   # (desde la raíz) PostgreSQL para la prueba de integración
-npm run test:int           # concurrencia contra PostgreSQL real
+npm ci
+npm test
 ```
-`npm run test:int` crea una base aislada `smartbancs_test` y verifica: 400 transferencias cruzadas en paralelo conservan el dinero total y no dejan saldos negativos; 50 débitos simultáneos de $10 sobre $100 aprueban exactamente 10; 20 reintentos con la misma `Idempotency-Key` debitan una sola vez; y con RabbitMQ caído los eventos quedan en el outbox y se publican al recuperarse.
 
-### URLs de los Servicios Desplegados
-| Servicio | URL Local | Credenciales / Info |
-| :--- | :--- | :--- |
-| **📱 Frontend Web App (React)** | [http://localhost:3000](http://localhost:3000) | Interfaz de Banca Digital |
-| **⚡ Backend API Core (NestJS)** | [http://localhost:4000/api/v1/accounts](http://localhost:4000/api/v1/accounts) | API REST Transaccional |
-| **📊 Métricas Prometheus** | [http://localhost:4000/metrics](http://localhost:4000/metrics) | Scrapeo de Telemetría |
-| **🧠 Microservicio IA (FastAPI)** | [http://localhost:8000/docs](http://localhost:8000/docs) | Swagger del AI Advisor |
-| **📬 RabbitMQ Management UI** | [http://localhost:15672](http://localhost:15672) | Usuario: `guest` / Clave: `guest` |
-| **📈 Prometheus Server** | [http://localhost:9090](http://localhost:9090) | Servidor de Monitoreo |
-| **📊 Grafana Dashboards** | [http://localhost:3001](http://localhost:3001) | Usuario: `admin` / Clave: `admin` |
+**Backend, integración** (12 pruebas contra un PostgreSQL real). Desde la raíz del repo:
 
----
+```bash
+docker compose up -d postgres
+cd backend
+npm run test:int
+```
 
-## 🧪 4. Ejecución del Pipeline ETL (Core Bancs Legacy)
+La prueba crea una base aislada `smartbancs_test`, aplica `sql/schema.sql` y usa el `TransactionsService` real. Verifica, entre otras cosas, que 400 transferencias cruzadas en paralelo conservan el total sin saldos negativos, que 50 débitos simultáneos de $10 sobre $100 aprueban exactamente 10, que 20 reintentos con la misma `Idempotency-Key` debitan una sola vez, que la misma clave con otro payload da 422, que 300 transferencias de centavos conservan el total, que el pool agotado responde 503 con `POOL_TIMEOUT` y que el relay solo marca `published_at` en los eventos confirmados. El broker de RabbitMQ se sustituye por un stub en estas pruebas. Se conecta a `localhost:5432` con `postgres`/`postgrespassword`; se puede cambiar con `TEST_DB_HOST`, `TEST_DB_PORT`, `TEST_DB_USER` y `TEST_DB_PASSWORD`.
 
-Para ejecutar la transformación del lote transaccional de Bancs manualmente:
+**ai-service** (16 pruebas; sin red: no llama a Gemini ni a RabbitMQ):
+
+```bash
+cd ai-service
+pip install -r requirements.txt -r requirements-dev.txt
+pytest
+```
+
+Cubren el consumidor (ack solo con 2xx o 409, reintentos del POST, nack hacia la DLQ, trazabilidad en los logs), el contrato de colas con el backend, el fallback heurístico ante errores de Gemini y `/model-info`.
+
+## ETL del core Bancs
 
 ```bash
 cd etl-bancs
+pip install -r requirements.txt
 python etl_bancs_processor.py
 ```
-El script generará el archivo `bancs_cleaned_features.json` con los datos limpios y variables predictivas para IA.
 
----
+Lee `bancs_raw_transactions.csv` (12 registros) y regenera `bancs_cleaned_features.json` (9 registros válidos). El pipeline elimina duplicados, descarta montos nulos y registros sin cuenta origen, normaliza fechas y moneda, mapea códigos a categorías y agrega variables para la IA (`isHighValue`, `logAmount`, `channelRiskScore`). El ETL no escribe en la base de datos. El visor ETL del frontend muestra una muestra de ejemplo fija en el código; no lee este JSON.
 
-## 📂 5. Estructura del Repositorio
+## Datos de prueba
 
-```
-├── backend/                   # Microservicio Transaccional en NestJS + TypeORM
-│   ├── src/
-│   │   ├── modules/accounts/         # Gestión de cuentas y saldos
-│   │   ├── modules/transactions/     # Lógica ACID con Pessimistic Locks
-│   │   ├── modules/recommendations/  # Persistencia de IA insights
-│   │   ├── modules/rabbitmq/         # Publicador de eventos asíncronos
-│   │   ├── modules/simulation/       # Simulador de incidente de quincena
-│   │   ├── common/logger/            # Winston Logger estructurado (JSON + CorrID)
-│   │   └── common/metrics/           # Métricas Prometheus
-│   ├── sql/                          # Scripts DDL y DML (Schema & Seed)
-│   └── Dockerfile
-├── frontend/                  # Aplicación Web React 18 + Vite + Tailwind CSS
-│   ├── src/components/               # Componentes interactivos (Banca, IA, Operaciones, ETL)
-│   └── Dockerfile
-├── ai-service/                # Microservicio IA (Python FastAPI + RabbitMQ Consumer)
-│   ├── main.py                       # API REST & Health
-│   ├── advisor.py                    # Motor de inferencia y scoring
-│   ├── consumer.py                   # Worker asíncrono
-│   └── Dockerfile
-├── etl-bancs/                 # Script de procesamiento ETL para Core Legado Bancs
-│   ├── bancs_raw_transactions.csv   # Lote en crudo con anomalías
-│   └── etl_bancs_processor.py        # Pipeline de limpieza y Feature Engineering
-├── docker/                    # Configuraciones de observabilidad
-│   ├── prometheus/                   # Configuración de scrapeo
-│   └── grafana/                      # Datasources y Dashboards
-├── docs/                      # Documentación Técnica Formal
-│   ├── DOCUMENTO_TECNICO.md          # Arquitectura, Bancs, IA, Operaciones y Post-Mortem
-│   └── AI_DISCLOSURE.md              # Declaración del uso de Inteligencia Artificial
-└── docker-compose.yml         # Orquestación integral con un solo comando
+| Datos | Dónde | Contenido |
+|---|---|---|
+| Cuentas semilla | [backend/sql/seed.sql](backend/sql/seed.sql) | 5 cuentas USD activas, `1000000001` a `1000000005`, con saldos entre 3 200 y 290 000. Se cargan al crear el volumen de PostgreSQL. |
+| Lote crudo de Bancs | [etl-bancs/bancs_raw_transactions.csv](etl-bancs/bancs_raw_transactions.csv) | 12 registros con duplicado, nulos, montos con símbolos y fechas en formatos mixtos. |
+| Salida del ETL | [etl-bancs/bancs_cleaned_features.json](etl-bancs/bancs_cleaned_features.json) | 9 registros limpios con variables para IA y metadatos de calidad. El script lo regenera. |
+| Pruebas de integración | [backend/test/concurrency.int-spec.ts](backend/test/concurrency.int-spec.ts) | Cuentas creadas por cada prueba en la base `smartbancs_test` (se trunca entre escenarios). |
+| Pruebas del ai-service | [ai-service/tests/test_consumer.py](ai-service/tests/test_consumer.py) | Mensajes AMQP y respuestas HTTP simuladas. |
+| Simulación de quincena | `POST /api/v1/simulation/quincena-spike` | Hasta 500 transferencias entre las cuentas semilla (`totalRequests` ≤ 500, `concurrentWorkers` ≤ 100). Requiere `SIMULATION_ENABLED=true`. |
+
+## Detener
+
+```bash
+docker compose down        # detiene y elimina los contenedores
+docker compose down -v     # además borra el volumen de PostgreSQL (vuelve a cargar schema y seed)
 ```
 
----
+Si levantaste una versión anterior del proyecto, usa `docker compose down -v` antes de `docker compose up --build`. Los scripts de `backend/sql` solo se ejecutan al crear el volumen, así que con un volumen viejo faltan las tablas nuevas (`outbox_events`, la columna `idempotency_key`). Además, si RabbitMQ conserva la cola `smartbancs.ai.queue` declarada sin los argumentos de la DLQ, rechaza la nueva declaración con `PRECONDITION_FAILED`; `down -v` también elimina los volúmenes anónimos del contenedor de RabbitMQ y con ellos esa cola.
 
-## 📑 6. Documentación Adicional
-- 📖 [Documento Técnico de Arquitectura y Operaciones](docs/DOCUMENTO_TECNICO.md)
-- 🧠 [IA: implementación, despliegue y MLOps](docs/IA_IMPLEMENTACION_Y_DESPLIEGUE.md)
-- 🔍 [Análisis de brechas contra la base de conocimiento](docs/ANALISIS_BRECHAS.md)
-- 📚 [Base de conocimiento (bóveda Obsidian)](docs/knowledge-base/00-MOC.md) y [RAG local](tools/kb-rag/README.md)
-- 🤖 [Declaración de Uso de Inteligencia Artificial](docs/AI_DISCLOSURE.md)
+## Estructura del repositorio
+
+```
+├── backend/                     API transaccional (NestJS + TypeORM)
+│   ├── src/modules/
+│   │   ├── transactions/        transferencias ACID, idempotencia, reintentos
+│   │   ├── outbox/              relay del Transactional Outbox
+│   │   ├── rabbitmq/            conexión con confirms, reconexión y topología (DLX/DLQ)
+│   │   ├── recommendations/     persistencia idempotente de recomendaciones de IA
+│   │   ├── accounts/            cuentas y saldos
+│   │   └── simulation/          pico de quincena y db-diagnostics (SIMULATION_ENABLED)
+│   ├── src/common/              logger, métricas, correlation ID, validación
+│   ├── sql/                     00-observability.sql, schema.sql, seed.sql
+│   └── test/                    pruebas de integración contra PostgreSQL
+├── ai-service/                  FastAPI + consumidor RabbitMQ + motor Gemini/heurístico
+│   ├── scripts/check_gemini.py  verificación de la API key
+│   └── tests/                   pytest
+├── etl-bancs/                   ETL del lote crudo de Bancs
+├── frontend/                    React 18 + Vite + Tailwind
+├── docker/                      configuración de Prometheus y Grafana
+├── docs/
+│   ├── DOCUMENTO_TECNICO.md
+│   ├── IA_IMPLEMENTACION_Y_DESPLIEGUE.md
+│   ├── ARQUITECTURA_DIAGRAMAS.md
+│   ├── ANALISIS_BRECHAS.md
+│   ├── AI_DISCLOSURE.md
+│   ├── revision/                informes de la segunda revisión con agentes
+│   ├── knowledge-base/          bóveda Obsidian (requisitos y referencias)
+│   ├── proceso/bitacora.md
+│   └── reto/reto-original.md    enunciado
+├── tools/kb-rag/                RAG local sobre la bóveda
+├── AGENTS.md, CLAUDE.md         instrucciones dadas a los agentes de código
+├── .env.example
+└── docker-compose.yml
+```
+
+## Documentación
+
+- [Documento técnico](docs/DOCUMENTO_TECNICO.md): arquitectura, integración con Bancs, IA, observabilidad, incidente y post mortem.
+- [IA: implementación, despliegue y MLOps](docs/IA_IMPLEMENTACION_Y_DESPLIEGUE.md)
+- [Diagramas de arquitectura](docs/ARQUITECTURA_DIAGRAMAS.md)
+- [Análisis de brechas](docs/ANALISIS_BRECHAS.md)
+- [Segunda revisión con equipo de agentes](docs/revision/README.md)
+- [Declaración de uso de IA](docs/AI_DISCLOSURE.md)
+- [Base de conocimiento](docs/knowledge-base/00-MOC.md) y [RAG local](tools/kb-rag/README.md)
+- [Bitácora del proceso](docs/proceso/bitacora.md)
