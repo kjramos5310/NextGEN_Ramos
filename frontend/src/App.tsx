@@ -119,7 +119,7 @@ export const App: React.FC = () => {
                             {recommendations[0].message}
                           </p>
                           <div className="pt-2 border-t border-slate-800/80 flex items-center justify-between text-[10px] text-slate-400">
-                            <span>Motor: Google Gemini 3.6 Flash</span>
+                            <span>Motor: Google Gemini 2.5 Flash</span>
                             <span>#{recommendations[0].accountNumber}</span>
                           </div>
                         </div>

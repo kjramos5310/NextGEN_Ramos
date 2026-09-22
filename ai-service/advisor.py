@@ -18,7 +18,7 @@ class FinancialAdvisorModel:
         self.model_version = "v2.5.0-gemini-hybrid"
         self.model_name = "SmartBancs-Gemini-Advisor"
         self.gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip()
-        self.gemini_model = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+        self.gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
         self.total_inferences = 0
         self.gemini_success_count = 0
         self.fallback_count = 0
@@ -62,7 +62,8 @@ class FinancialAdvisorModel:
         if not self.gemini_api_key:
             return None
 
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.gemini_model}:generateContent?key={self.gemini_api_key}"
+        # La API key va en el header x-goog-api-key y no en la URL, para que no quede en logs de proxies ni trazas
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.gemini_model}:generateContent"
         
         system_instruction = (
             "Eres el Asesor Financiero Inteligente y Motor de Detección de Riesgo de SmartBancs. "
@@ -110,10 +111,12 @@ class FinancialAdvisorModel:
             }
         }
 
-        headers = {"Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json", "x-goog-api-key": self.gemini_api_key}
         
         try:
+            started = time.time()
             response = requests.post(url, json=payload, headers=headers, timeout=10.0)
+            latency_ms = (time.time() - started) * 1000
             if response.status_code == 200:
                 resp_json = response.json()
                 candidates = resp_json.get("candidates", [])
@@ -128,13 +131,15 @@ class FinancialAdvisorModel:
                             parsed["engine"] = f"Google-Gemini ({self.gemini_model})"
                             if "confidenceScore" not in parsed:
                                 parsed["confidenceScore"] = 0.95
+                            logger.info(f"[GEMINI-API] OK {self.gemini_model} en {latency_ms:.0f} ms (tx {tx_data.get('transactionId')})")
                             return parsed
+                logger.warning("[GEMINI-API] Respuesta 200 sin JSON válido. Aplicando fallback a reglas locales.")
             elif response.status_code == 429:
                 logger.warning("[GEMINI-API] Cuota excedida (HTTP 429 Rate Limit). Aplicando fallback a reglas locales.")
             else:
                 logger.warning(f"[GEMINI-API] Error de API Gemini HTTP {response.status_code}: {response.text[:200]}")
         except requests.exceptions.Timeout:
-            logger.warning("[GEMINI-API] Timeout en llamada a Gemini (>4.5s). Aplicando fallback no bloqueante.")
+            logger.warning("[GEMINI-API] Timeout en llamada a Gemini (>10s). Aplicando fallback no bloqueante.")
         except Exception as ex:
             logger.error(f"[GEMINI-API] Excepción al invocar Gemini: {str(ex)}")
 

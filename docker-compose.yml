@@ -91,7 +91,7 @@ services:
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
       BACKEND_API_URL: http://backend:4000
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
-      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.6-flash}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash}
     depends_on:
       - rabbitmq
       - backend
