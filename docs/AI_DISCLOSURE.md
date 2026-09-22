@@ -44,7 +44,6 @@ Las decisiones críticas de diseño son del candidato: arquitectura, modelo de d
 5. **Correcciones** en commits identificados por brecha (G1–G10).
 6. **Segunda revisión con un equipo de agentes** de Claude Code, con roles separados: concurrencia y base de datos, SRE y observabilidad, coherencia entre documentación y código, y diagramas. Sus informes y el estado de cada hallazgo están en [revision/](revision/README.md). Siguió una ronda de correcciones.
 
-Los commits hechos con Claude Code llevan la línea `Co-Authored-By: Claude`.
 
 ## Validación
 
