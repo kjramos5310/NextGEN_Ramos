@@ -15,33 +15,38 @@ El enunciado está en [docs/reto/reto-original.md](docs/reto/reto-original.md).
 ```mermaid
 flowchart LR
     user(["Navegador"])
-    subgraph compose["docker compose"]
-        fe["frontend<br/>React + nginx :3000"]
-        be["backend<br/>NestJS :4000<br/>relay del outbox"]
-        pg[("PostgreSQL 16 :5432<br/>outbox_events")]
-        mq{{"RabbitMQ :5672<br/>DLQ smartbancs.ai.dlq"}}
+
+    subgraph compose["docker compose (7 servicios)"]
+        fe["frontend<br/>React + nginx<br/>:3000"]
+        be["backend NestJS :4000<br/>API de transferencias<br/>+ relay del outbox"]
+        pg[("PostgreSQL 16 :5432<br/>accounts · transactions<br/>outbox_events · ai_recommendations")]
+        mq["RabbitMQ :5672<br/>smartbancs.ai.queue<br/>smartbancs.bancs.sync.queue<br/>smartbancs.ai.dlq"]
         ai["ai-service<br/>FastAPI :8000"]
         prom["Prometheus :9090"]
         graf["Grafana :3001"]
     end
-    gem["Gemini API<br/>(opcional)"]
-    bancs["Core Bancs<br/>(diseño)"]
-    etl["etl-bancs<br/>script Python"]
 
-    user --> fe
-    user -->|"REST /api/v1"| be
-    be -->|"transacción + outbox"| pg
-    be -->|"publisher confirms"| mq
-    mq -->|"smartbancs.ai.queue"| ai
-    ai -->|"POST /recommendations"| be
-    ai -.-> gem
-    prom -->|"/metrics"| be
-    graf --> prom
-    mq -.->|"bancs.sync.queue, sin consumidor"| bancs
-    bancs -.->|"CSV"| etl
+    gem["Gemini API<br/>gemini-3.6-flash"]
+    worker["Worker hacia Bancs<br/>con rate limiting<br/>(diseño)"]
+    bancs["Core Bancs<br/>(externo)"]
+    etl["etl-bancs<br/>Python + pandas"]
+
+    user -->|"carga la SPA"| fe
+    user -->|"la SPA llama REST /api/v1"| be
+    be -->|"1 transacción: saldos +<br/>transactions + outbox"| pg
+    be -->|"relay: publish con<br/>publisher confirms"| mq
+    mq -->|"transaction.created"| ai
+    ai -->|"generateContent"| gem
+    ai -->|"POST /api/v1/recommendations"| be
+    mq -.->|"bancs.sync"| worker
+    worker -.-> bancs
+    bancs -.->|"lote CSV"| etl
+    etl -->|"features JSON"| etlout[["bancs_cleaned_features.json"]]
+    prom -->|"scrape /metrics"| be
+    graf -->|"PromQL"| prom
 ```
 
-Las líneas discontinuas son opcionales o de diseño. Los diagramas completos están en [docs/ARQUITECTURA_DIAGRAMAS.md](docs/ARQUITECTURA_DIAGRAMAS.md): secuencia de la transferencia, relay y DLQ, modelo de datos, Bancs y ETL, observabilidad y estados del outbox.
+Las líneas discontinuas son de diseño: la cola `bancs.sync` ya recibe un evento por transferencia, pero el worker que lo entregaría a Bancs no está implementado. El ETL es un script aparte que procesa un lote CSV del core. Los diagramas completos están en [docs/ARQUITECTURA_DIAGRAMAS.md](docs/ARQUITECTURA_DIAGRAMAS.md): secuencia de la transferencia, relay y DLQ, modelo de datos, Bancs y ETL, observabilidad y estados del outbox.
 
 ## Stack
 

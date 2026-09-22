@@ -26,7 +26,8 @@ flowchart LR
 
     etl["etl-bancs<br/>script Python pandas<br/>ejecución manual, fuera del compose"]
     gem["Google Gemini API<br/>gemini-3.6-flash<br/>externo, opcional"]
-    bancs["Core Bancs legado<br/>externo<br/>(diseño)"]
+    worker["Worker hacia Bancs<br/>rate limiting<br/>(diseño)"]
+    bancs["Core Bancs legado<br/>externo"]
 
     user -->|"HTTP :3000 estáticos"| fe
     user -->|"HTTP REST :4000 /api/v1"| be
@@ -37,7 +38,8 @@ flowchart LR
     ai -->|"HTTPS generateContent<br/>solo con GEMINI_API_KEY"| gem
     prom -->|"scrape /metrics cada 5 s"| be
     graf -->|"PromQL"| prom
-    mq -.->|"smartbancs.bancs.sync.queue<br/>sin consumidor (diseño)"| bancs
+    mq -.->|"smartbancs.bancs.sync.queue"| worker
+    worker -.-> bancs
     bancs -.->|"CSV crudo bancs_raw_transactions.csv"| etl
 ```
 
