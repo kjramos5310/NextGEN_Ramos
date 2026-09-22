@@ -3,6 +3,17 @@ services:
     image: postgres:16-alpine
     container_name: smartbancs-postgres
     restart: unless-stopped
+    # Diagnóstico del incidente de quincena (R3.5a-c):
+    #  - pg_stat_statements: ranking de consultas por tiempo total / media
+    #  - log_lock_waits: registra la consulta bloqueada y el PID que la bloquea
+    #  - log_min_duration_statement: registra toda consulta > 500 ms
+    command: >
+      postgres
+      -c shared_preload_libraries=pg_stat_statements
+      -c pg_stat_statements.track=all
+      -c log_lock_waits=on
+      -c deadlock_timeout=1s
+      -c log_min_duration_statement=500
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgrespassword
@@ -11,6 +22,7 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./backend/sql/00-observability.sql:/docker-entrypoint-initdb.d/00-observability.sql
       - ./backend/sql/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
       - ./backend/sql/seed.sql:/docker-entrypoint-initdb.d/02-seed.sql
     healthcheck:
@@ -54,6 +66,11 @@ services:
       DB_SYNCHRONIZE: "false"
       DB_POOL_MAX: 30
       DB_POOL_MIN: 5
+      DB_LOCK_TIMEOUT_MS: 2000        # G3: espera máxima por un lock de fila (SQLSTATE 55P03)
+      DB_STATEMENT_TIMEOUT_MS: 5000   # G3: duración máxima de una sentencia (SQLSTATE 57014)
+      TX_MAX_ATTEMPTS: 3              # reintentos ante deadlock 40P01 / serialización 40001
+      OUTBOX_POLL_INTERVAL_MS: 500    # G1: frecuencia del relay del outbox
+      OUTBOX_BATCH_SIZE: 100
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
       AI_SERVICE_URL: http://ai-service:8000
     depends_on:
