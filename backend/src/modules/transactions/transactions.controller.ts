@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Body, Param, Req, Query } from '@nestjs/common';
+import { BadRequestException, Controller, Get, Post, Body, Param, Req, Query } from '@nestjs/common';
 import { Request } from 'express';
 import { TransactionsService } from './transactions.service';
 import { CreateTransactionDto } from './dto/create-transaction.dto';
@@ -13,7 +13,12 @@ export class TransactionsController {
     @Req() req: Request,
   ) {
     const correlationId = (req.headers['x-correlation-id'] as string) || 'GEN-' + Date.now();
-    return this.transactionsService.processTransaction(createTransactionDto, correlationId);
+    // Idempotency-Key (G2): el cliente la genera una vez por intento lógico de transferencia
+    const idempotencyKey = (req.headers['idempotency-key'] as string | undefined)?.trim();
+    if (idempotencyKey && idempotencyKey.length > 64) {
+      throw new BadRequestException('Idempotency-Key no puede superar 64 caracteres');
+    }
+    return this.transactionsService.processTransaction(createTransactionDto, correlationId, idempotencyKey || undefined);
   }
 
   @Get()

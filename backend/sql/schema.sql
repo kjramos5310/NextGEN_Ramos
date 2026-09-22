@@ -43,8 +43,13 @@ CREATE TABLE IF NOT EXISTS transactions (
     status transaction_status_enum NOT NULL DEFAULT 'PENDING',
     error_message VARCHAR(500),
     execution_time_ms INT DEFAULT 0,
+    -- Idempotencia (G2): un reintento del cliente con la misma clave no genera un segundo débito
+    idempotency_key VARCHAR(64),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_transactions_idempotency_key
+    ON transactions(idempotency_key) WHERE idempotency_key IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_transactions_source ON transactions(source_account_number);
 CREATE INDEX IF NOT EXISTS idx_transactions_target ON transactions(target_account_number);
@@ -66,4 +71,28 @@ CREATE TABLE IF NOT EXISTS ai_recommendations (
 );
 
 CREATE INDEX IF NOT EXISTS idx_ai_recs_account ON ai_recommendations(account_number);
+-- Consumidor idempotente: la entrega es at-least-once, una recomendación por transacción
+CREATE UNIQUE INDEX IF NOT EXISTS uq_ai_recs_transaction
+    ON ai_recommendations(transaction_id) WHERE transaction_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_ai_recs_created ON ai_recommendations(created_at DESC);
+
+-- 5. Transactional Outbox (G1)
+-- El evento se inserta en la MISMA transacción que el débito/crédito. Un relay lo publica
+-- en RabbitMQ después del COMMIT, así no hay dual-write: si la transacción hace rollback
+-- el evento no existe, y si el broker está caído el evento espera en esta tabla.
+CREATE TABLE IF NOT EXISTS outbox_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    aggregate_type VARCHAR(50) NOT NULL,          -- 'transaction'
+    aggregate_id VARCHAR(64) NOT NULL,            -- id de la transacción
+    event_type VARCHAR(100) NOT NULL,             -- routing key: transaction.created, bancs.sync
+    payload JSONB NOT NULL,
+    correlation_id VARCHAR(64),
+    attempts INT NOT NULL DEFAULT 0,
+    last_error VARCHAR(500),
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    published_at TIMESTAMP WITH TIME ZONE
+);
+
+-- Índice parcial: el relay solo recorre lo pendiente, la tabla puede crecer sin penalizar el sondeo
+CREATE INDEX IF NOT EXISTS idx_outbox_pending
+    ON outbox_events(created_at) WHERE published_at IS NULL;

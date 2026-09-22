@@ -77,6 +77,9 @@ export class Transaction {
   @Column({ name: 'execution_time_ms', type: 'int', default: 0 })
   executionTimeMs: number;
 
+  @Column({ name: 'idempotency_key', type: 'varchar', length: 64, nullable: true })
+  idempotencyKey: string | null;
+
   @CreateDateColumn({ name: 'created_at', type: 'timestamp with time zone' })
   createdAt: Date;
 }

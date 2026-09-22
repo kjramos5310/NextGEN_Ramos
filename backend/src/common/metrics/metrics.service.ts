@@ -12,6 +12,9 @@ export class MetricsService {
   public readonly activeDbConnectionsGauge: client.Gauge<string>;
   public readonly deadlocksDetectedCounter: client.Counter<string>;
   public readonly aiRecommendationDurationSeconds: client.Histogram<string>;
+  public readonly dbErrorsCounter: client.Counter<string>;
+  public readonly transactionRetriesCounter: client.Counter<string>;
+  public readonly outboxPendingGauge: client.Gauge<string>;
 
   constructor() {
     this.registry = new client.Registry();
@@ -59,7 +62,8 @@ export class MetricsService {
 
     this.deadlocksDetectedCounter = new client.Counter({
       name: 'smartbancs_deadlocks_detected_total',
-      help: 'Total database deadlocks or lock timeouts detected during high concurrency',
+      help: 'Deadlocks (40P01) y lock timeouts (55P03) detectados, por SQLSTATE',
+      labelNames: ['sqlstate'],
       registers: [this.registry],
     });
 
@@ -67,6 +71,26 @@ export class MetricsService {
       name: 'smartbancs_ai_recommendation_duration_seconds',
       help: 'Latency of AI financial recommendation calculation in seconds',
       buckets: [0.01, 0.05, 0.1, 0.2, 0.5, 1.0],
+      registers: [this.registry],
+    });
+
+    this.dbErrorsCounter = new client.Counter({
+      name: 'smartbancs_db_errors_total',
+      help: 'Errores de base de datos por SQLSTATE (57014 = statement_timeout, 55P03 = lock_timeout, 40P01 = deadlock)',
+      labelNames: ['sqlstate'],
+      registers: [this.registry],
+    });
+
+    this.transactionRetriesCounter = new client.Counter({
+      name: 'smartbancs_transaction_retries_total',
+      help: 'Reintentos automáticos de transacciones por conflicto de concurrencia',
+      labelNames: ['sqlstate'],
+      registers: [this.registry],
+    });
+
+    this.outboxPendingGauge = new client.Gauge({
+      name: 'smartbancs_outbox_pending_events',
+      help: 'Eventos en outbox_events aún no publicados en RabbitMQ (backlog hacia IA y Bancs)',
       registers: [this.registry],
     });
   }
@@ -82,8 +106,24 @@ export class MetricsService {
     this.transactionDurationSeconds.observe({ status }, durationSeconds);
   }
 
-  recordDeadlock() {
-    this.deadlocksDetectedCounter.inc();
+  /**
+   * Clasifica errores de PostgreSQL por SQLSTATE (G3), no por el texto del mensaje.
+   * 40P01 deadlock_detected · 55P03 lock_not_available (lock_timeout)
+   * 57014 query_canceled (statement_timeout) · 40001 serialization_failure
+   */
+  recordDbError(sqlstate: string) {
+    this.dbErrorsCounter.inc({ sqlstate });
+    if (sqlstate === '40P01' || sqlstate === '55P03') {
+      this.deadlocksDetectedCounter.inc({ sqlstate });
+    }
+  }
+
+  recordTransactionRetry(sqlstate: string) {
+    this.transactionRetriesCounter.inc({ sqlstate });
+  }
+
+  setOutboxPending(count: number) {
+    this.outboxPendingGauge.set(count);
   }
 
   async getMetrics(): Promise<string> {

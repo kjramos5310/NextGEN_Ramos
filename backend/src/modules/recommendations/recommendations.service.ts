@@ -36,6 +36,15 @@ export class RecommendationsService {
     confidenceScore?: number;
     metadata?: Record<string, any>;
   }): Promise<AIRecommendation> {
+    // Consumidor idempotente: el outbox entrega at-least-once, un reenvío no duplica la recomendación
+    if (data.transactionId) {
+      const existing = await this.recommendationRepository.findOne({ where: { transactionId: data.transactionId } });
+      if (existing) {
+        this.logger.log(`Duplicate AI event ignored for transaction ${data.transactionId}`);
+        return existing;
+      }
+    }
+
     const recommendation = this.recommendationRepository.create({
       ...data,
       confidenceScore: data.confidenceScore ?? 0.95,

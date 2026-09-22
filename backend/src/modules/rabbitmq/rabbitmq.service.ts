@@ -73,7 +73,7 @@ export class RabbitMQService implements OnModuleInit, OnModuleDestroy {
       }
     }
 
-    this.logger.warn('RabbitMQ is currently unavailable. Asynchronous events will use memory buffer fallback.');
+    this.logger.warn('RabbitMQ is currently unavailable. Events remain in outbox_events until the broker recovers.');
   }
 
   async publishEvent(routingKey: string, payload: any, correlationId?: string): Promise<boolean> {
@@ -98,7 +98,7 @@ export class RabbitMQService implements OnModuleInit, OnModuleDestroy {
         this.logger.log(`Event published to RabbitMQ [${routingKey}]`, { correlationId, routingKey });
         return true;
       } else {
-        this.logger.warn(`RabbitMQ not connected. Event queued locally: [${routingKey}]`, { correlationId });
+        this.logger.warn(`RabbitMQ not connected. Event [${routingKey}] not published; it stays pending in outbox_events`, { correlationId });
         return false;
       }
     } catch (error) {
