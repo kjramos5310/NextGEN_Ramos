@@ -14,11 +14,9 @@
 
 ## 🏛️ 1. Arquitectura de la Solución
 
-```
-![Diagrama de Arquitectura SmartBancs](./docs/Architecture.png)
-
-
-```
+<p align="center">
+  <img src="docs/Architecture.png" alt="Diagrama de Arquitectura SmartBancs" width="100%" />
+</p>
 
 ---
 
