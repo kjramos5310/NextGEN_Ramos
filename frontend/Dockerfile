@@ -6,6 +6,10 @@ COPY package*.json ./
 RUN npm ci
 
 COPY . .
+# URL pública del backend, se fija en build (Vite la incrusta en el bundle).
+# Vacía = http://localhost:4000/api/v1 (docker compose local).
+ARG VITE_API_URL=""
+ENV VITE_API_URL=$VITE_API_URL
 RUN npm run build
 
 FROM nginx:alpine
