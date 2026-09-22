@@ -24,11 +24,14 @@
 
 1. **Cumplimiento Estricto de SLA (< 2s):**
    - Transacciones procesadas en base de datos en ~15-20 ms.
-   - Despacho de eventos de Inteligencia Artificial y sincronización con Bancs hacia RabbitMQ de forma asíncrona y no bloqueante.
+   - Los eventos para la IA y para Bancs se guardan en un **Transactional Outbox** dentro de la misma transacción; un relay los publica en RabbitMQ fuera del camino crítico (sin *dual-write*: si el broker cae, los eventos no se pierden).
+   - Header `Idempotency-Key`: un reintento del cliente nunca genera un doble débito.
 2. **Prevención de Condiciones de Carrera (Race Conditions) y Deadlocks:**
    - Implementación de bloqueo pesimista ordenado (`SELECT ... FOR UPDATE`) ordenando lexicográficamente las cuentas antes de bloquear.
+   - `lock_timeout` / `statement_timeout` por transacción, clasificación de errores por SQLSTATE (`40P01`, `55P03`, `57014`) y reintento con backoff ante deadlock.
+   - Prueba de concurrencia automatizada contra PostgreSQL real (ver sección de pruebas).
 3. **Integración con Core Legado (Bancs):**
-   - Estrategia *Transactional Outbox* con Rate Limiting para sincronizar saldos sin saturar el sistema heredado.
+   - *Transactional Outbox* implementado (tabla `outbox_events` + relay con `SKIP LOCKED`); el consumo hacia Bancs con Rate Limiting está diseñado en el documento técnico.
    - Script ETL en Python (`etl-bancs/etl_bancs_processor.py`) para limpieza, imputación de nulos y *feature engineering* de datos en crudo.
 4. **Microservicio de Inteligencia Artificial:**
    - Motor de recomendaciones financieras (`ai-service`) con categorización de gastos, alertas de sobrecosto y scoring de inversión en segundo plano.
@@ -52,6 +55,24 @@ Clona el repositorio y ejecuta desde la raíz:
 ```bash
 docker compose up --build
 ```
+
+> Si ya habías levantado una versión anterior, recrea el volumen de la base para que se apliquen las tablas nuevas (`outbox_events`, `idempotency_key`): `docker compose down -v` y luego `docker compose up --build`.
+
+### Detener la solución
+```bash
+docker compose down        # detiene los contenedores
+docker compose down -v     # además borra los datos de PostgreSQL
+```
+
+### Pruebas
+```bash
+cd backend
+npm install
+npm test                   # pruebas unitarias
+docker compose up -d postgres   # (desde la raíz) PostgreSQL para la prueba de integración
+npm run test:int           # concurrencia contra PostgreSQL real
+```
+`npm run test:int` crea una base aislada `smartbancs_test` y verifica: 400 transferencias cruzadas en paralelo conservan el dinero total y no dejan saldos negativos; 50 débitos simultáneos de $10 sobre $100 aprueban exactamente 10; 20 reintentos con la misma `Idempotency-Key` debitan una sola vez; y con RabbitMQ caído los eventos quedan en el outbox y se publican al recuperarse.
 
 ### URLs de los Servicios Desplegados
 | Servicio | URL Local | Credenciales / Info |
@@ -115,5 +136,8 @@ El script generará el archivo `bancs_cleaned_features.json` con los datos limpi
 ---
 
 ## 📑 6. Documentación Adicional
-- 📖 [Documento Técnico de Arquitectura y Operaciones](file:///d:/proyectos/pruebaTecnicaTCS/docs/DOCUMENTO_TECNICO.md)
-- 🤖 [Declaración de Uso de Inteligencia Artificial](file:///d:/proyectos/pruebaTecnicaTCS/docs/AI_DISCLOSURE.md)
+- 📖 [Documento Técnico de Arquitectura y Operaciones](docs/DOCUMENTO_TECNICO.md)
+- 🧠 [IA: implementación, despliegue y MLOps](docs/IA_IMPLEMENTACION_Y_DESPLIEGUE.md)
+- 🔍 [Análisis de brechas contra la base de conocimiento](docs/ANALISIS_BRECHAS.md)
+- 📚 [Base de conocimiento (bóveda Obsidian)](docs/knowledge-base/00-MOC.md) y [RAG local](tools/kb-rag/README.md)
+- 🤖 [Declaración de Uso de Inteligencia Artificial](docs/AI_DISCLOSURE.md)

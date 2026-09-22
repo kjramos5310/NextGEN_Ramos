@@ -20,67 +20,64 @@ sequenceDiagram
     participant Broker as 📬 RabbitMQ (Topic Exchange)
     participant AI as 🧠 AI Service (Python FastAPI)
 
-    Cliente->>API: POST /api/v1/transactions (Monto, Cuentas)
-    Note over API,DB: Transacción ACID con Bloqueo Pesimista
-    API->>DB: SELECT ... FOR UPDATE (Cuentas ordenadas)
-    API->>DB: UPDATE balances & INSERT transaction (COMPLETED)
-    API->>DB: COMMIT Transaction (~15 ms)
-    
+    participant Relay as 🔁 Outbox Relay (backend)
+
+    Cliente->>API: POST /api/v1/transactions (Idempotency-Key, x-correlation-id)
+    Note over API,DB: Una sola transacción ACID (READ COMMITTED + lock_timeout/statement_timeout)
+    API->>DB: SELECT ... FOR UPDATE (cuentas en orden determinista)
+    API->>DB: UPDATE saldos + INSERT transactions
+    API->>DB: INSERT outbox_events (transaction.created, bancs.sync)
+    API->>DB: COMMIT
+    API-->>Cliente: HTTP 201 Created (la IA no está en el camino crítico)
+
     rect rgb(30, 41, 59)
-    Note over API,Broker: Despacho Asíncrono Fire-and-Forget (No Bloqueante)
-    API--)Broker: publishEvent("transaction.created", aiPayload)
+    Note over Relay,Broker: Fuera del camino crítico, cada 500 ms
+    Relay->>DB: SELECT pendientes FOR UPDATE SKIP LOCKED
+    Relay->>Broker: publish(transaction.created, eventId)
+    Relay->>DB: UPDATE published_at (solo si el broker aceptó)
     end
 
-    API-->>Cliente: HTTP 201 Created (Tx ID, Status: COMPLETED) [Latencia Total: ~18 ms]
-
-    Note over Broker,AI: Procesamiento en Segundo Plano (Background Worker)
     Broker->>AI: Consume evento desde smartbancs.ai.queue
-    AI->>AI: Ejecuta inferencia heurística / ML (Categoría, Anomalia, Ahorro)
-    AI->>DB: INSERT into ai_recommendations (Recomendación generada)
+    AI->>AI: Inferencia (Gemini o motor heurístico local)
+    AI->>API: POST /api/v1/recommendations (x-correlation-id)
+    API->>DB: INSERT ai_recommendations (idempotente por transaction_id)
     AI-->>Broker: basic_ack
 ```
 
 ### 1.2. Demostración en el Código del Microservicio Principal (`backend`)
-En el archivo [`backend/src/modules/transactions/transactions.service.ts`](file:///d:/proyectos/pruebaTecnicaTCS/backend/src/modules/transactions/transactions.service.ts):
+La transferencia no llama a la IA ni publica en RabbitMQ: escribe el evento en la tabla `outbox_events` **dentro de la misma transacción** y responde en cuanto termina el `COMMIT`. Fragmento de `backend/src/modules/transactions/transactions.service.ts`:
 
 ```typescript
-// 1. Ejecución transaccional atómica en PostgreSQL
+await queryRunner.manager.save(Transaction, createdTx);
+
+// TRANSACTIONAL OUTBOX: los eventos se escriben en la MISMA transacción.
+// Si hay rollback no existen; si RabbitMQ está caído esperan en la tabla. No hay dual-write.
+await queryRunner.manager.insert(OutboxEvent, this.buildOutboxEvents(createdTx, sourceAccount, correlationId));
+
 await queryRunner.commitTransaction();
-
-const totalTimeSec = (Date.now() - startTime) / 1000;
-this.metricsService.recordTransaction('COMPLETED', createdTx.category, totalTimeSec);
-
-// 2. DISPATCH ASÍNCRONO NO BLOQUEANTE:
-// Se invoca sin 'await' bloqueante en la respuesta HTTP inmediata al cliente.
-this.dispatchAsyncEvents(createdTx, sourceAccount, correlationId);
-
-// 3. Respuesta inmediata al cliente (< 20 ms)
-return createdTx;
+return createdTx; // la IA y Bancs se alimentan del outbox, fuera del camino crítico
 ```
 
-Método de despacho hacia RabbitMQ:
+El relay (`backend/src/modules/outbox/outbox-relay.service.ts`) publica en segundo plano:
+
 ```typescript
-private dispatchAsyncEvents(tx: Transaction, sourceAccount: Account, correlationId: string) {
-  const aiPayload = {
-    transactionId: tx.id,
-    accountNumber: tx.sourceAccountNumber,
-    amount: tx.amount,
-    category: tx.category,
-    currentBalance: sourceAccount.balance,
-    description: tx.description,
-    timestamp: tx.createdAt,
-  };
-  
-  // Publicación en cola 'smartbancs.ai.queue'
-  this.rabbitmqService.publishEvent('transaction.created', aiPayload, correlationId).catch((err) => {
-    this.logger.warn(`Failed async publish to AI queue: ${err.message}`, { correlationId });
-  });
+const rows = await qr.query(
+  `SELECT id, event_type, payload, correlation_id FROM outbox_events
+    WHERE published_at IS NULL ORDER BY created_at LIMIT $1
+    FOR UPDATE SKIP LOCKED`, [this.batchSize]);
+
+for (const row of rows) {
+  const ok = await this.rabbitmqService.publishEvent(row.event_type, { eventId: row.id, ...row.payload }, row.correlation_id);
+  if (!ok) break;                       // broker caído: el evento sigue pendiente, no se pierde
+  await qr.query(`UPDATE outbox_events SET published_at = now() WHERE id = $1`, [row.id]);
 }
 ```
 
+**Por qué así y no "fire-and-forget":** publicar después del `COMMIT` sin outbox es un *dual-write*: si el proceso o RabbitMQ caen entre ambos pasos, la transferencia existe pero la IA y Bancs nunca se enteran. Con el outbox la garantía es que el evento se publica si y solo si la transacción se confirmó. La prueba `backend/test/concurrency.int-spec.ts` lo verifica con el broker caído y luego recuperado.
+
 ### 1.3. Microservicio Independiente de IA (`ai-service`): Integración Gemini + Fallback
-Ubicado en [`ai-service/`](file:///d:/proyectos/pruebaTecnicaTCS/ai-service), implementado en **Python FastAPI** con consumidor asíncrono [`consumer.py`](file:///d:/proyectos/pruebaTecnicaTCS/ai-service/consumer.py) y motor de inferencia [`advisor.py`](file:///d:/proyectos/pruebaTecnicaTCS/ai-service/advisor.py):
-- **Consumo Real de Google Gemini API:** Mediante la variable de entorno `GEMINI_API_KEY`, invoca los modelos generativos de Google (`gemini-1.5-flash` / `gemini-2.0-flash`) con salidas estructuradas en JSON estricto (`responseMimeType: "application/json"`).
+Ubicado en [`ai-service/`](../ai-service), implementado en **Python FastAPI** con consumidor asíncrono [`consumer.py`](../ai-service/consumer.py) y motor de inferencia [`advisor.py`](../ai-service/advisor.py):
+- **Consumo Real de Google Gemini API:** Mediante la variable de entorno `GEMINI_API_KEY`, invoca el modelo generativo de Google configurado en la variable `GEMINI_MODEL` con salidas estructuradas en JSON estricto (`responseMimeType: "application/json"`).
 - **Parser Resiliente de Doble Capa (*Self-Healing JSON*):**  
   Implementado en `advisor.py`, asegura que las respuestas del LLM no interrumpan el flujo transaccional:
   - *Capa 1:* Sanitización y remoción de etiquetas markdown (` ```json ... ``` `).
@@ -118,7 +115,7 @@ El ciclo de vida del modelo de recomendación financiera sigue el estándar **ML
 ```
 
 1. **Alimentación Continua con Nuevos Datos:**
-   - El pipeline ETL diario ([`etl_bancs_processor.py`](file:///d:/proyectos/pruebaTecnicaTCS/etl-bancs/etl_bancs_processor.py)) extrae las transacciones consolidadas de Bancs y SmartBancs.
+   - El pipeline ETL diario ([`etl_bancs_processor.py`](../etl-bancs/etl_bancs_processor.py)) extrae las transacciones consolidadas de Bancs y SmartBancs.
    - Las transacciones son limpiadas, anonimizadas (cumplimiento regulatorio PCI-DSS y GDPR) y enriquecidas con variables de comportamiento (`logAmount`, `channelRiskScore`, frecuencia semanal).
    - Se almacenan en el **Feature Store**, permitiendo que el entrenamiento utilice datos históricos consistentes.
 

@@ -94,6 +94,12 @@ Leyenda: **✅** cumple · **⚠️** parcial · **❌** brecha.
 - **Acción:** un consumidor mock de Bancs con límite de tasa y DLQ ya demuestra el patrón completo, y es poco código.
 - **Prioridad: media.**
 
+### G10 — La métrica de conexiones del pool nunca se actualizaba (detectada durante la corrección)
+- **Referencia:** [[Connection Pooling y 10k TPS]], [[Observabilidad]] (R3.5b).
+- **Código:** `smartbancs_db_active_connections` se declaraba en `metrics.service.ts`, pero ningún código le asignaba valor: siempre valía 0, y la alerta `ConnectionPoolExhaustion` del documento técnico nunca podía dispararse.
+- **Acción:** leer `totalCount`, `idleCount` y `waitingCount` del pool de `pg` en cada scrape y exponer también `smartbancs_db_pool_waiting_requests`.
+- **Prioridad: media.**
+
 ### G9 — Faltan evidencias E4
 - Video demostrativo, material de presentación y datos de prueba.
 - **Prioridad: alta**, porque es un entregable explícito del reto.
@@ -105,3 +111,19 @@ Leyenda: **✅** cumple · **⚠️** parcial · **❌** brecha.
 4. G9: video y presentación.
 
 Cada corrección va en su propio commit, con el ID de la brecha en el mensaje (`fix(G1): ...`).
+
+## 4. Estado de las correcciones
+
+| Brecha | Estado | Commit |
+|---|---|---|
+| G1 Outbox transaccional | ✅ Corregida: tabla `outbox_events` + relay `SKIP LOCKED`; consumidor de recomendaciones idempotente | `fix(G1,G2,G3,G6)` |
+| G2 Idempotency-Key | ✅ Corregida en API y frontend | `fix(G1,G2,G3,G6)`, `feat(G2)` |
+| G3 Deadlocks y timeouts | ✅ Corregida: SQLSTATE, `lock_timeout`, `statement_timeout`, reintento con backoff | `fix(G1,G2,G3,G6)` |
+| G4 Prueba de concurrencia | ✅ `npm run test:int` (4 escenarios contra PostgreSQL real; falla si se quita el lock) | `test(G4)` |
+| G5 10k TPS | ⏳ Pendiente: PgBouncer documentado como acción preventiva | — |
+| G6 `synchronize` | ✅ Corregida | `fix(G1,G2,G3,G6)` |
+| G7 Consulta exacta | ✅ `pg_stat_statements`, `log_lock_waits`, runbook en `sql/00-observability.sql` | `feat(G7)` |
+| G8 Ritmo hacia Bancs | ⏳ Parcial: el evento sale del outbox a una cola durable; el worker con rate limiting queda diseñado | — |
+| G9 Video y presentación | ⏳ Pendiente | — |
+| G10 Métrica del pool | ✅ Corregida | `fix(G10)` |
+

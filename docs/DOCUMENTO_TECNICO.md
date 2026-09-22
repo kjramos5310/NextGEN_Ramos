@@ -59,8 +59,9 @@
 ### 2.1. Estrategia de Sincronización sin Saturar el Core Legado
 El Core Bancario Legado (*Bancs*) presenta restricciones de concurrencia y no soporta consultas masivas. Para resolver esto:
 
-1. **Patrón Transactional Outbox Asíncrono (Salida):**  
-   Cuando se completa una transferencia en SmartBancs, se emite un evento a la cola `smartbancs.bancs.sync.queue` en RabbitMQ. Un worker dedicado con **Token Bucket Rate Limiting** despacha las actualizaciones al Core Bancs en micro-lotes (*micro-batches*) durante ventanas de baja carga, evitando picos de CPU en el mainframe/legado.
+1. **Patrón Transactional Outbox (Salida) — implementado:**  
+   La transferencia escribe, **en la misma transacción ACID**, el débito/crédito, el registro en `transactions` y dos filas en `outbox_events` (`transaction.created` para la IA y `bancs.sync` para Bancs). Un relay (`outbox/outbox-relay.service.ts`) lee las filas pendientes con `SELECT ... FOR UPDATE SKIP LOCKED` y las publica en RabbitMQ; solo las marca como publicadas si el broker las aceptó. Así se evita el *dual-write*: si la transacción hace rollback el evento no existe, y si RabbitMQ está caído el evento espera en la tabla en lugar de perderse. La entrega es *at-least-once*, por lo que cada mensaje lleva `eventId` y los consumidores son idempotentes. En producción el relay por sondeo se reemplazaría por CDC sobre el WAL (Debezium Outbox Event Router).  
+   **Consumo hacia Bancs (diseño):** un worker dedicado sobre `smartbancs.bancs.sync.queue` con **Token Bucket Rate Limiting** despacharía las actualizaciones al Core Bancs en micro-lotes, protegiendo al legado de los picos. En el MVP la cola se alimenta desde el outbox; el worker de Bancs queda como siguiente paso.
 2. **Change Data Capture - CDC (Entrada):**  
    Para sincronizar movimientos originados directamente en el Core Legado (cajeros físicos o cheques), se implementa un conector CDC (ej. Debezium / Kafka Connect) que lee los logs de transacciones del motor de Bancs sin ejecutar `SELECT` sobre tablas productivas.
 
@@ -105,8 +106,11 @@ El cálculo de recomendaciones de IA no se realiza dentro del ciclo de vida de l
 - **Métricas Prometheus (`/metrics`):** Implementadas en `common/metrics/metrics.service.ts` con `prom-client`:
   - `smartbancs_transactions_total`: Contador de transacciones agrupadas por estado (`COMPLETED`, `FAILED`) y categoría.
   - `smartbancs_transaction_duration_seconds`: Histograma de latencia transaccional (buckets: 5ms, 10ms, 20ms, 50ms, 100ms, 500ms, 1s, 2s).
-  - `smartbancs_deadlocks_detected_total`: Contador de bloqueos mutuos o timeouts de locks.
-  - `smartbancs_db_active_connections`: Medición de conexiones activas en el connection pool.
+  - `smartbancs_deadlocks_detected_total{sqlstate}`: Deadlocks (`40P01`) y lock timeouts (`55P03`), clasificados por SQLSTATE.
+  - `smartbancs_db_errors_total{sqlstate}`: Todos los errores de BD por SQLSTATE (p. ej. `57014` = `statement_timeout`).
+  - `smartbancs_transaction_retries_total{sqlstate}`: Reintentos automáticos ante conflictos de concurrencia.
+  - `smartbancs_db_active_connections` / `smartbancs_db_pool_waiting_requests`: Conexiones en uso y peticiones esperando conexión en el pool (leídas del pool de `pg` en cada scrape).
+  - `smartbancs_outbox_pending_events`: Backlog de eventos aún no publicados hacia IA y Bancs.
   - `http_requests_total` / `http_request_duration_seconds`: Tráfico HTTP general por método, ruta y código de estado.
 - **Trazabilidad Distribuida:** Middleware `correlation-id.middleware.ts` inyecta automáticamente un UUID `x-correlation-id` en cada petición HTTP. Este ID se propaga a los logs del backend, a los mensajes publicados en RabbitMQ y al microservicio de IA, permitiendo reconstruir la trazabilidad completa de una transacción a través de todos los componentes.
 - **Interceptor de Auditoría:** `logging.interceptor.ts` registra método HTTP, URL, código de estado, duración y correlationId de cada petición, además de alimentar los contadores de Prometheus.
@@ -132,7 +136,7 @@ Para identificar problemas de rendimiento, degradación del servicio o fallos, s
 | `HighTransactionLatency` | `histogram_quantile(0.95, smartbancs_transaction_duration_seconds) > 1.0` durante 2 min | WARNING | Notificar en Slack al equipo de guardia |
 | `SLAViolation` | `histogram_quantile(0.95, ...) > 2.0` durante 1 min | CRITICAL | Pager al SRE + ejecutar runbook de mitigación |
 | `DeadlockDetected` | `rate(smartbancs_deadlocks_detected_total[1m]) > 0` | CRITICAL | Investigación inmediata + consulta `pg_locks` |
-| `ConnectionPoolExhaustion` | `smartbancs_db_active_connections > 20` (80% de max=25) | WARNING | Evaluar escalado o PgBouncer |
+| `ConnectionPoolExhaustion` | `smartbancs_db_active_connections > 24` (80% de `DB_POOL_MAX`=30) o `smartbancs_db_pool_waiting_requests > 0` durante 1m | WARNING | Evaluar escalado o PgBouncer |
 | `HighErrorRate` | `rate(http_requests_total{status_code=~"5.."}[5m]) / rate(http_requests_total[5m]) > 0.05` | CRITICAL | Circuit breaker + diagnóstico de logs |
 
 #### C. Dashboards de Grafana Propuestos
@@ -162,13 +166,21 @@ Durante un pico de quincena, se genera un alto volumen de transferencias concurr
    Esto elimina matemáticamente la posibilidad de un ciclo de espera circular (condición de Coffman), **impidiendo que ocurra un deadlock**.
 2. **Ajuste de Connection Pool y Timeouts:**
    Configuración de `idleTimeoutMillis: 30000` y `connectionTimeoutMillis: 5000` en TypeORM/Postgres para liberar recursos rápidamente en situaciones de estrés.
-3. **Detección de Deadlocks en Código:**
-   En el bloque `catch` de `processTransaction()`, se detectan errores de deadlock (`error.message.includes('deadlock')`) y se registran en la métrica `smartbancs_deadlocks_detected_total`, lo que dispara la alerta `DeadlockDetected` en Prometheus.
+3. **Timeouts por transacción:**
+   Cada transferencia ejecuta `SET LOCAL lock_timeout = '2000ms'` y `SET LOCAL statement_timeout = '5000ms'` (configurables con `DB_LOCK_TIMEOUT_MS` y `DB_STATEMENT_TIMEOUT_MS`). Una fila bloqueada o una consulta lenta ya no retienen la conexión indefinidamente: la petición falla rápido con `503` y libera el pool.
+4. **Detección y reintento por SQLSTATE:**
+   Los errores se clasifican por código SQLSTATE de PostgreSQL, no por el texto del mensaje: `40P01` (deadlock) y `40001` (serialización) se reintentan hasta 3 veces con *backoff* y *jitter*; `55P03` (lock timeout) y `57014` (statement timeout) devuelven `503`. Todos se registran en `smartbancs_db_errors_total` y `smartbancs_deadlocks_detected_total`, y el log de error incluye SQLSTATE, número de intento y la consulta exacta que falló.
+5. **Idempotencia:**
+   `POST /api/v1/transactions` acepta el header `Idempotency-Key` (índice único parcial en `transactions.idempotency_key`). Si un cliente reintenta tras un timeout, recibe la transacción original en lugar de generar un segundo débito, incluso si los reintentos llegan en paralelo.
+6. **Prueba de concurrencia automatizada (`backend/test/concurrency.int-spec.ts`):**
+   Se ejecuta contra PostgreSQL real con `npm run test:int` y verifica: 400 transferencias cruzadas en paralelo conservan el dinero total y no dejan saldos negativos; 50 débitos simultáneos de $10 sobre $100 aprueban exactamente 10; 20 reintentos con la misma `Idempotency-Key` debitan una sola vez; y con RabbitMQ caído los eventos quedan en el outbox y se publican al recuperarse. Se comprobó que la prueba falla si se elimina el lock pesimista.
 
 ### 5.3. Monitoreo Práctico en Código
 El endpoint `GET /api/v1/simulation/db-diagnostics` (implementado en `simulation.service.ts`) ejecuta directamente contra PostgreSQL:
 - **`pg_stat_activity`:** Identifica qué queries están activas, en qué estado (`active`, `idle in transaction`), su duración y si están esperando un evento de bloqueo (`wait_event_type`, `wait_event`). Esto permite encontrar el proceso exacto que causa el cuello de botella.
 - **`pg_locks`:** Muestra qué filas de las tablas `accounts` y `transactions` están bloqueadas, en qué modo (`RowExclusiveLock`, `ShareLock`) y si el lock fue concedido o está en espera. Un lock `granted = false` sobre una tabla indica contención activa.
+
+Además, el PostgreSQL del `docker-compose.yml` arranca con `pg_stat_statements` (ranking de consultas por tiempo total y medio), `log_lock_waits=on` con `deadlock_timeout=1s` (registra la consulta bloqueada y el PID que la bloquea) y `log_min_duration_statement=500` (toda consulta de más de 500 ms queda en el log). Las consultas del runbook están en `backend/sql/00-observability.sql`.
 
 ### 5.4. Plan de Mitigación Inmediata (Runbook de Emergencia)
 En caso de presentarse degradación en quincena:
@@ -226,8 +238,8 @@ Esta corrección elimina la posibilidad matemática de deadlocks por la ausencia
 
 | Ámbito | Acción | Responsable | Plazo |
 | :--- | :--- | :--- | :--- |
-| **Código** | Implementar circuit breaker (ej. `opossum`) con timeout de 1.5s por operación transaccional. Si la BD no responde en 1.5s, retornar `503 Service Unavailable` en lugar de retener la conexión. | Backend Team | Sprint 1 |
-| **Código** | Agregar prueba de concurrencia automatizada: 50 transferencias simultáneas sobre las mismas cuentas, verificando que no se produzcan deadlocks ni inconsistencias de saldo. | QA/Backend | Sprint 1 |
+| **Código** | ✅ *Implementado:* `lock_timeout` y `statement_timeout` por transacción con respuesta `503` en lugar de retener la conexión. Pendiente: circuit breaker (ej. `opossum`) para cortar tráfico cuando la tasa de `503` supere un umbral. | Backend Team | Sprint 1 |
+| **Código** | ✅ *Implementado:* prueba de concurrencia automatizada contra PostgreSQL real (`npm run test:int`): conservación de saldos, doble gasto, idempotencia y outbox. Pendiente: ejecutarla en el pipeline de CI en cada merge. | QA/Backend | Sprint 1 |
 | **Infraestructura** | Desplegar **PgBouncer** como proxy de connection pooling frente a PostgreSQL para soportar hasta 10,000 conexiones lógicas con un pool físico de 50 conexiones. | SRE/Infra | Sprint 2 |
 | **Infraestructura** | Configurar réplicas de lectura de PostgreSQL para descargar queries de consulta (`GET /accounts`, `GET /transactions`) de la instancia primaria. | SRE/Infra | Sprint 2 |
 | **Monitoreo** | Crear alerta `ConnectionPoolSaturation` que dispare cuando `db_active_connections` supere el 80% del máximo configurado (`DB_POOL_MAX`). | SRE | Sprint 1 |

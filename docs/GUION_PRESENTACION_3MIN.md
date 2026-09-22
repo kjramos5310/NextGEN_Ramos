@@ -22,7 +22,7 @@
 ---
 
 ### 🔹 BLOQUE 1: Introducción y Arquitectura General (00:00 – 00:30)
-* **Qué proyectar en pantalla:** Mostrar el diagrama de arquitectura en el [README.md](file:///d:/proyectos/pruebaTecnicaTCS/README.md) o la terminal con `docker compose ps` mostrando los 7 microservicios activos.
+* **Qué proyectar en pantalla:** Mostrar el diagrama de arquitectura en el [README.md](../README.md) o la terminal con `docker compose ps` mostrando los 7 microservicios activos.
 * **Lo que dices (Speech):**
 
 > *"Buenas tardes al comité técnico de TCS. Mi nombre es [Tu Nombre] y presento la solución para el reto **SmartBancs App**, una plataforma bancaria moderna, resiliente y de alta concurrencia.*
@@ -41,7 +41,7 @@
 > 
 > *Al confirmar, observen la velocidad: la transacción se ejecutó en **menos de 30 milisegundos**. ¿Cómo lo logramos? Implementamos **bloqueo pesimista exclusivo a nivel de fila (`SELECT ... FOR UPDATE`)**, garantizando el aislamiento `READ COMMITTED` y protegiendo contra saldos negativos o condiciones de carrera.*
 > 
-> *Y lo más importante para el SLA: el análisis cognitivo de Inteligencia Artificial **no bloquea** la respuesta HTTP del usuario. La API confirma la transacción en base de datos, emite un evento asíncrono a RabbitMQ y devuelve de inmediato el código 201 Created junto a su **Correlation ID**."*
+> *Y lo más importante para el SLA: el análisis cognitivo de Inteligencia Artificial **no bloquea** la respuesta HTTP del usuario. En la misma transacción ACID se guarda el evento en una tabla **outbox**; la API responde 201 en cuanto hace COMMIT, y un relay publica el evento a RabbitMQ en segundo plano. Así no hay *dual-write*: si RabbitMQ se cae, el evento no se pierde, espera en la tabla. Y cada transferencia lleva un **Idempotency-Key**, para que un reintento del cliente nunca genere un doble débito."*
 
 ---
 
@@ -51,7 +51,7 @@
 
 > *"El segundo gran desafío es la coexistencia con el Core Legado 'Bancs'. Para no saturar este mainframe con millones de consultas concurrentes, diseñé una estrategia dual:*
 > 
-> *Primero, un patrón **Transactional Outbox asíncrono** con buffers y Rate Limiting para sincronizar transferencias salientes hacia Bancs en micro-lotes fuera de horas pico. Y segundo, **Change Data Capture (CDC)** para capturar movimientos físicos de sucursales leyendo directamente los logs de la base de datos sin lanzar consultas `SELECT` sobre tablas productivas.*
+> *Primero, el mismo **Transactional Outbox**: cada transferencia deja un evento `bancs.sync` en una cola durable, y un worker con Rate Limiting lo entrega a Bancs en micro-lotes, al ritmo que el legado soporta. El outbox está implementado; el worker de Bancs está diseñado en el documento técnico. Y segundo, **Change Data Capture (CDC)** para capturar movimientos físicos de sucursales leyendo directamente los logs de la base de datos sin lanzar consultas `SELECT` sobre tablas productivas.*
 > 
 > *Adicionalmente, implementé un pipeline ETL en Python con Pandas que procesa los lotes crudos de Bancs: elimina transacciones duplicadas, descarta nulos o NaN, homologa formatos de fecha heterogéneos a ISO-8601 UTC y genera atributos predictivos de Feature Engineering como el `channelRiskScore` para alimentar a los modelos."*
 
@@ -65,7 +65,7 @@
 > 
 > *Bajo ráfagas masivas, el mayor riesgo bancario son los deadlocks y el agotamiento del pool de conexiones. Voy a disparar una simulación de 40 operaciones simultáneas.*
 > 
-> *Como observan en los resultados: **tasa de éxito del 100%, cero deadlocks detectados y una latencia p95 muy por debajo de los 2 segundos**. Esto se logra porque en el código implementé un **ordenamiento determinista de cuentas**: siempre se bloquea primero la cuenta menor y luego la mayor, eliminando la condición de espera circular de Coffman.*
+> *Como observan en los resultados: **tasa de éxito del 100%, cero deadlocks detectados y una latencia p95 muy por debajo de los 2 segundos**. Esto se logra porque en el código implementé un **ordenamiento determinista de cuentas**: siempre se bloquea primero la cuenta menor y luego la mayor, eliminando la condición de espera circular de Coffman. Y si aun así la base se congestiona, cada transacción tiene `lock_timeout` y `statement_timeout`: falla rápido con 503 en vez de acaparar conexiones, y los errores se clasifican por código SQLSTATE. Esto no lo afirmo solo: hay una prueba automatizada contra PostgreSQL real con 400 transferencias cruzadas en paralelo que verifica que el dinero total se conserva.*
 > 
 > *En observabilidad, instrumentamos logs estructurados en JSON con Winston, propagación de `x-correlation-id` en cada salto de red, y métricas Prometheus que alimentan nuestros dashboards en Grafana para diagnosticar saturación antes de que impacte al usuario."*
 
