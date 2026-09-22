@@ -7,6 +7,7 @@ import { AIAdvisorFeed } from './components/AIAdvisorFeed';
 import { OperationsIncidentConsole } from './components/OperationsIncidentConsole';
 import { ETLViewer } from './components/ETLViewer';
 import { api } from './services/api';
+import { aiEngineLabel } from './utils/aiEngine';
 import { Account, Transaction, AIRecommendation } from './types';
 import { RefreshCw, Shield, Sparkles, ArrowRight, CheckCircle2 } from 'lucide-react';
 
@@ -119,7 +120,7 @@ export const App: React.FC = () => {
                             {recommendations[0].message}
                           </p>
                           <div className="pt-2 border-t border-slate-800/80 flex items-center justify-between text-[10px] text-slate-400">
-                            <span>Motor: Google Gemini 2.5 Flash</span>
+                            <span>Motor: {aiEngineLabel(recommendations[0])}</span>
                             <span>#{recommendations[0].accountNumber}</span>
                           </div>
                         </div>
@@ -143,7 +144,7 @@ export const App: React.FC = () => {
                         </li>
                         <li className="flex items-start space-x-2">
                           <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 flex-shrink-0 mt-0.5" />
-                          <span><strong>SLA &lt; 2.0 Segundos:</strong> Despacho fire-and-forget a RabbitMQ; respuesta en &lt; 20 ms.</span>
+                          <span><strong>Transactional Outbox:</strong> el evento se guarda en la misma transacción y un relay lo publica en RabbitMQ fuera del camino crítico.</span>
                         </li>
                         <li className="flex items-start space-x-2">
                           <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 flex-shrink-0 mt-0.5" />

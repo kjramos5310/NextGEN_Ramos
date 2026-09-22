@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { AIRecommendation } from '../types';
 import { api } from '../services/api';
+import { aiEngineLabel } from '../utils/aiEngine';
 import { Sparkles, AlertTriangle, TrendingUp, PiggyBank, ShieldAlert, Check, CheckCheck, Filter, RefreshCw, Cpu } from 'lucide-react';
 
 interface AIAdvisorFeedProps {
@@ -72,11 +73,11 @@ export const AIAdvisorFeed: React.FC<AIAdvisorFeedProps> = ({ recommendations, o
             <div className="flex items-center space-x-2">
               <h2 className="text-base font-bold text-white tracking-tight">Motor de Análisis Cognitivo y Gestión de Riesgo</h2>
               <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-blue-500/10 text-blue-300 border border-blue-500/20 font-semibold">
-                Google Gemini 2.5 Flash
+                Gemini 2.5 Flash · fallback heurístico
               </span>
             </div>
             <p className="text-xs text-slate-400">
-              Evaluación asíncrona desacoplada en RabbitMQ (SLA transaccional inalterado &lt; 20 ms)
+              Evaluación asíncrona: el evento sale de la tabla outbox hacia RabbitMQ y no bloquea la transferencia. El motor real se indica en cada recomendación.
             </p>
           </div>
         </div>
@@ -130,8 +131,7 @@ export const AIAdvisorFeed: React.FC<AIAdvisorFeedProps> = ({ recommendations, o
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           {filteredRecs.map((rec) => {
             const style = getBadgeStyle(rec.type);
-            const metadata = (rec as any).metadata || {};
-            const riskLevel = metadata.riskLevel || 'LOW';
+            const riskLevel = typeof rec.metadata?.riskLevel === 'string' ? rec.metadata.riskLevel : '—';
 
             return (
               <div
@@ -172,6 +172,7 @@ export const AIAdvisorFeed: React.FC<AIAdvisorFeedProps> = ({ recommendations, o
 
                 <div className="flex items-center justify-between pt-2.5 border-t border-slate-800 text-[11px] text-slate-400">
                   <span className="font-mono text-[10px]">
+                    Motor: {aiEngineLabel(rec)} ·{' '}
                     {new Date(rec.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
                   </span>
                   {!rec.isRead ? (

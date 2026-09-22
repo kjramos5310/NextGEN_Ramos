@@ -35,9 +35,18 @@ export interface AIRecommendation {
   title: string;
   message: string;
   confidenceScore: number;
-  metadata?: Record<string, any>;
+  metadata?: AIRecommendationMetadata | null;
   isRead: boolean;
   createdAt: string;
+}
+
+/** Motor que generó la recomendación (lo informa el ai-service en metadata.engine). */
+export type AIEngine = 'gemini-2.5-flash' | 'heuristic-fallback';
+
+export interface AIRecommendationMetadata {
+  engine?: AIEngine | string;
+  riskLevel?: string;
+  [key: string]: unknown;
 }
 
 export interface SimulationResult {
@@ -52,4 +61,34 @@ export interface SimulationResult {
   maxLatencyMs: number;
   slaTargetUnder2s: boolean;
   errors: string[];
+}
+
+/** Respuesta de GET /simulation/db-diagnostics. Todos los campos son opcionales: la UI muestra "—" si faltan. */
+export interface DbDiagnostics {
+  timestamp?: string;
+  activeConnectionsCount?: number;
+  activeQueries?: Array<{
+    pid: number;
+    state?: string;
+    query?: string;
+    wait_event_type?: string | null;
+    wait_event?: string | null;
+    duration?: unknown;
+  }>;
+  blockedSessionsCount?: number;
+  idleInTransactionCount?: number;
+  pool?: { total?: number; idle?: number; waiting?: number } | null;
+  /** Quién bloquea a quién (pg_blocking_pids): una fila por par bloqueado/bloqueante */
+  blockingChains?: Array<{
+    blocked_pid: number;
+    blocked_query?: string;
+    blocking_pid: number;
+    blocking_state?: string;
+    blocking_query?: string;
+    blocking_xact_seconds?: number | string;
+    [key: string]: unknown;
+  }>;
+  healthStatus?: string;
+  recommendedAction?: string;
+  error?: string;
 }

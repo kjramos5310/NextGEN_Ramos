@@ -72,7 +72,7 @@ export const ETLViewer: React.FC = () => {
             </div>
             <h4 className="text-xs font-bold text-white uppercase tracking-wider">Transactional Outbox + Buffer Asíncrono</h4>
             <p className="text-xs text-slate-400 leading-relaxed">
-              Las transacciones procesadas por la API SmartBancs depositan un mensaje en la cola RabbitMQ (<code className="text-blue-300">smartbancs.bancs.sync.queue</code>). Un worker consumidor con <strong>Rate Limiting</strong> envía batches controlados al Core Bancs en ventanas de baja concurrencia, protegiendo su CPU.
+              Cada transferencia guarda un evento <code className="text-blue-300">bancs.sync</code> en la tabla outbox dentro de la misma transacción; un relay lo publica en la cola <code className="text-blue-300">smartbancs.bancs.sync.queue</code>. <em>Propuesta (no incluida en el MVP):</em> un worker con <strong>Rate Limiting</strong> que envíe lotes controlados al Core Bancs en ventanas de baja concurrencia.
             </p>
           </div>
 
@@ -82,7 +82,7 @@ export const ETLViewer: React.FC = () => {
             </div>
             <h4 className="text-xs font-bold text-white uppercase tracking-wider">Change Data Capture (CDC Ingress)</h4>
             <p className="text-xs text-slate-400 leading-relaxed">
-              Para los movimientos originados en sucursales físicas sobre Bancs, se implementa CDC sobre los logs de base de datos sin lanzar consultas pesadas (<code className="text-emerald-300">SELECT *</code>) en las tablas de producción del core legado.
+              <em>Propuesta (no incluida en el MVP):</em> para los movimientos originados en sucursales físicas sobre Bancs, se usaría CDC sobre los logs de base de datos sin lanzar consultas pesadas (<code className="text-emerald-300">SELECT *</code>) en las tablas de producción del core legado.
             </p>
           </div>
 
@@ -101,7 +101,7 @@ export const ETLViewer: React.FC = () => {
           <div className="bank-card rounded-xl p-4">
             <div className="flex items-center space-x-2 text-rose-400 text-xs font-semibold mb-2">
               <AlertCircle className="w-4 h-4" />
-              <span>Dataset Crudo de Bancs (Con Nulos, NaN, Duplicados y Fechas No Estandarizadas)</span>
+              <span>Extracto de bancs_raw_transactions.csv (Con Nulos, NaN, Duplicados y Fechas No Estandarizadas)</span>
             </div>
             <div className="overflow-x-auto rounded border border-slate-800">
               <table className="w-full text-left text-[11px] font-mono">
@@ -136,7 +136,7 @@ export const ETLViewer: React.FC = () => {
           <div className="bank-card rounded-xl p-4">
             <div className="flex items-center space-x-2 text-emerald-400 text-xs font-semibold mb-2">
               <CheckCircle2 className="w-4 h-4" />
-              <span>Salida Limpia del Pipeline ETL (Normalizada y Lista para Features de IA)</span>
+              <span>Extracto de bancs_cleaned_features.json (Salida del Pipeline ETL)</span>
             </div>
             <div className="overflow-x-auto rounded border border-slate-800">
               <table className="w-full text-left text-[11px] font-mono">

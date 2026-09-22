@@ -1,6 +1,21 @@
-import { Account, Transaction, AIRecommendation, SimulationResult } from '../types';
+import { Account, Transaction, AIRecommendation, SimulationResult, DbDiagnostics } from '../types';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:4000/api/v1';
+
+/** Error HTTP con el mensaje que devolvió el backend (NestJS: `message` puede ser string o string[]). */
+export class ApiError extends Error {
+  constructor(message: string, public readonly status?: number, public readonly correlationId?: string | null) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
+const toApiError = async (res: Response, fallback: string): Promise<ApiError> => {
+  const body = await res.json().catch(() => null);
+  const raw = body?.message;
+  const message = Array.isArray(raw) ? raw.join('; ') : typeof raw === 'string' && raw ? raw : fallback;
+  return new ApiError(message, res.status, res.headers.get('x-correlation-id'));
+};
 
 export const api = {
   // Accounts
@@ -30,15 +45,19 @@ export const api = {
     description?: string;
     category?: string;
   }, idempotencyKey: string = crypto.randomUUID()): Promise<Transaction> => {
-    const res = await fetch(`${API_BASE_URL}/transactions`, {
-      method: 'POST',
-      // Idempotency-Key: un doble clic o un reintento de red con la misma clave no genera un segundo débito
-      headers: { 'Content-Type': 'application/json', 'Idempotency-Key': idempotencyKey },
-      body: JSON.stringify(data),
-    });
+    let res: Response;
+    try {
+      res = await fetch(`${API_BASE_URL}/transactions`, {
+        method: 'POST',
+        // Idempotency-Key: un doble clic o un reintento de red con la misma clave no genera un segundo débito
+        headers: { 'Content-Type': 'application/json', 'Idempotency-Key': idempotencyKey },
+        body: JSON.stringify(data),
+      });
+    } catch {
+      throw new ApiError('No se pudo conectar con el backend. Puedes reintentar: la misma Idempotency-Key evita un doble débito.');
+    }
     if (!res.ok) {
-      const errData = await res.json().catch(() => ({ message: 'Error procesando transacción' }));
-      throw new Error(errData.message || 'Error en la transacción');
+      throw await toApiError(res, `Error en la transacción (HTTP ${res.status})`);
     }
     return res.json();
   },
@@ -68,13 +87,13 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ totalRequests }),
     });
-    if (!res.ok) throw new Error('Error al ejecutar simulación de quincena');
+    if (!res.ok) throw await toApiError(res, `Error al ejecutar simulación de quincena (HTTP ${res.status})`);
     return res.json();
   },
 
-  getDbDiagnostics: async () => {
+  getDbDiagnostics: async (): Promise<DbDiagnostics> => {
     const res = await fetch(`${API_BASE_URL}/simulation/db-diagnostics`);
-    if (!res.ok) throw new Error('Error al obtener diagnósticos de BD');
+    if (!res.ok) throw await toApiError(res, `Error al obtener diagnósticos de BD (HTTP ${res.status})`);
     return res.json();
   },
 };

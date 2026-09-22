@@ -53,7 +53,7 @@ export const Header: React.FC<HeaderProps> = ({ activeTab, setActiveTab, unreadA
             >
               <span className="flex items-center space-x-1.5">
                 <Sparkles className="w-3.5 h-3.5 text-blue-300" />
-                <span>Análisis Cognitivo (Gemini)</span>
+                <span>Análisis Cognitivo (IA)</span>
                 {unreadAiCount > 0 && (
                   <span className="ml-1 px-1.5 py-0.2 text-[10px] font-bold rounded-full bg-blue-500 text-white">
                     {unreadAiCount}
@@ -94,12 +94,12 @@ export const Header: React.FC<HeaderProps> = ({ activeTab, setActiveTab, unreadA
           {/* System Status Indicators */}
           <div className="flex items-center space-x-2.5">
             <div className="flex items-center space-x-1.5 px-2.5 py-1 rounded bg-slate-900 border border-slate-800 text-[11px] text-slate-300">
-              <span className="w-2 h-2 rounded-full bg-emerald-500"></span>
+              <span className="w-2 h-2 rounded-full bg-slate-500"></span>
               <span className="font-mono text-slate-400">PostgreSQL ACID</span>
             </div>
             <div className="hidden sm:flex items-center space-x-1.5 px-2.5 py-1 rounded bg-blue-500/10 border border-blue-500/20 text-[11px] text-blue-300">
               <CheckCircle2 className="w-3.5 h-3.5 text-blue-400" />
-              <span>SLA &lt; 2s</span>
+              <span>Objetivo SLA &lt; 2s</span>
             </div>
           </div>
         </div>

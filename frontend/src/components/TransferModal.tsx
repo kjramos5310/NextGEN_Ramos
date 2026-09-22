@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
-import { Account } from '../types';
-import { api } from '../services/api';
+import { Account, Transaction } from '../types';
+import { api, ApiError } from '../services/api';
 import { X, Send, AlertCircle, CheckCircle2, Loader2, ArrowRight } from 'lucide-react';
 
 interface TransferModalProps {
@@ -11,15 +11,20 @@ interface TransferModalProps {
   onSuccess: () => void;
 }
 
-export const TransferModal: React.FC<TransferModalProps> = ({
-  isOpen,
+// Monto positivo con máximo 2 decimales (el backend rechaza con 400 si trae más)
+const AMOUNT_PATTERN = /^\d+(\.\d{1,2})?$/;
+
+// El contenido se monta en cada apertura: estado limpio y una Idempotency-Key nueva por apertura.
+// (Los hooks no pueden ir después de un return condicional, por eso el guard está en este envoltorio.)
+export const TransferModal: React.FC<TransferModalProps> = (props) =>
+  props.isOpen ? <TransferModalContent {...props} /> : null;
+
+const TransferModalContent: React.FC<TransferModalProps> = ({
   onClose,
   accounts,
   defaultSourceAccount,
   onSuccess,
 }) => {
-  if (!isOpen) return null;
-
   const [sourceAccountNumber, setSourceAccountNumber] = useState(
     defaultSourceAccount?.accountNumber || (accounts[0]?.accountNumber ?? '')
   );
@@ -32,18 +37,25 @@ export const TransferModal: React.FC<TransferModalProps> = ({
 
   const [isLoading, setIsLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const [successResult, setSuccessResult] = useState<any | null>(null);
+  const [errorCorrelationId, setErrorCorrelationId] = useState<string | null>(null);
+  const [successResult, setSuccessResult] = useState<Transaction | null>(null);
   // Una clave por intención de transferencia (por apertura del modal), reutilizada en reintentos
   const [idempotencyKey] = useState(() => crypto.randomUUID());
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMsg(null);
+    setErrorCorrelationId(null);
     setSuccessResult(null);
 
-    const parsedAmount = parseFloat(amount);
-    if (isNaN(parsedAmount) || parsedAmount <= 0) {
-      setErrorMsg('Ingresa un monto válido mayor a 0');
+    const trimmedAmount = amount.trim();
+    if (!AMOUNT_PATTERN.test(trimmedAmount)) {
+      setErrorMsg('Ingresa un monto válido con máximo 2 decimales (p. ej. 180.50)');
+      return;
+    }
+    const parsedAmount = Number(trimmedAmount);
+    if (parsedAmount <= 0) {
+      setErrorMsg('Ingresa un monto mayor a 0');
       return;
     }
 
@@ -64,8 +76,15 @@ export const TransferModal: React.FC<TransferModalProps> = ({
 
       setSuccessResult(res);
       onSuccess();
-    } catch (err: any) {
-      setErrorMsg(err.message || 'Error en el procesamiento transaccional');
+    } catch (err) {
+      // Se muestra el mensaje del backend tal cual (p. ej. 422 por Idempotency-Key reutilizada
+      // con otros datos, 503 por alta contención, 400 por validación).
+      if (err instanceof ApiError) {
+        setErrorMsg(err.status ? `${err.message} (HTTP ${err.status})` : err.message);
+        setErrorCorrelationId(err.correlationId ?? null);
+      } else {
+        setErrorMsg(err instanceof Error ? err.message : 'Error en el procesamiento transaccional');
+      }
     } finally {
       setIsLoading(false);
     }
@@ -84,14 +103,19 @@ export const TransferModal: React.FC<TransferModalProps> = ({
         <div className="mb-5">
           <h3 className="text-base font-bold text-white tracking-tight">Emisión de Transferencia Monetaria</h3>
           <p className="text-xs text-slate-400">
-            Transacción ACID con bloqueo pesimista ordenado y despacho no bloqueante hacia IA
+            Transacción ACID con bloqueo pesimista ordenado; los eventos se guardan en la tabla outbox dentro de la misma transacción y un relay los publica después en RabbitMQ
           </p>
         </div>
 
         {errorMsg && (
           <div className="mb-4 p-3 rounded-lg bg-rose-500/10 border border-rose-500/20 flex items-start space-x-2 text-rose-400 text-xs">
             <AlertCircle className="w-4 h-4 flex-shrink-0 mt-0.5" />
-            <span>{errorMsg}</span>
+            <div className="space-y-0.5">
+              <span>{errorMsg}</span>
+              {errorCorrelationId && (
+                <p className="font-mono text-[10px] text-slate-400">Correlation-ID: {errorCorrelationId}</p>
+              )}
+            </div>
           </div>
         )}
 
@@ -106,7 +130,7 @@ export const TransferModal: React.FC<TransferModalProps> = ({
           </div>
         )}
 
-        <form onSubmit={handleSubmit} className="space-y-4">
+        <form onSubmit={handleSubmit} noValidate className="space-y-4">
           <div className="grid grid-cols-2 gap-3">
             <div>
               <label className="block text-[11px] font-semibold text-slate-300 mb-1">Cuenta Débito (Origen):</label>
@@ -183,7 +207,7 @@ export const TransferModal: React.FC<TransferModalProps> = ({
                 <option value="TRANSFER">Transferencia Directa (TRANSFER)</option>
                 <option value="SALARY">Nómina / Salario (SALARY)</option>
                 <option value="SHOPPING">Compras (SHOPPING)</option>
-                <option value="UTILITIES">Servicios Básicos (UTILITIES)</option>
+                <option value="SERVICES">Servicios Básicos (SERVICES)</option>
               </select>
             </div>
 
