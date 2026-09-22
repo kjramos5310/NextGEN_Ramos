@@ -21,7 +21,7 @@ from advisor import advisor  # noqa: E402
 if not advisor.gemini_api_key:
     sys.exit("GEMINI_API_KEY no está definida en .env")
 
-print(f"Modelo: {advisor.gemini_model} | key: {advisor.gemini_api_key[:4]}… ({len(advisor.gemini_api_key)} caracteres)")
+print(f"Modelo: {advisor.gemini_model} | key configurada ({len(advisor.gemini_api_key)} caracteres)")
 tx = {
     "transactionId": "check-gemini",
     "accountNumber": "1000000001",

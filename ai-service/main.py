@@ -1,14 +1,16 @@
 import threading
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import Optional, Dict, Any
-from advisor import advisor
-from consumer import start_consumer
+from typing import Optional
+from advisor import advisor, GEMINI_TIMEOUT_SECONDS, HEURISTIC_ENGINE, VALID_TYPES
+from consumer import start_consumer, consumer_state, QUEUE_NAME, DLQ_NAME
+
+SERVICE_VERSION = "2.5.0"
 
 app = FastAPI(
     title="SmartBancs AI Financial Advisor Service",
     description="Microservicio de Inteligencia Artificial para recomendaciones financieras asíncronas",
-    version="2.4.0"
+    version=SERVICE_VERSION,
 )
 
 class TransactionInput(BaseModel):
@@ -27,15 +29,20 @@ def startup_event():
 
 @app.get("/health")
 def health():
+    consumer = consumer_state.snapshot()
     return {
-        "status": "UP",
+        # DEGRADED si el hilo consumidor no está conectado a RabbitMQ
+        "status": "UP" if consumer["connected"] else "DEGRADED",
         "service": "smartbancs-ai-service",
+        "serviceVersion": SERVICE_VERSION,
         "modelVersion": advisor.model_version,
         "geminiApiKeyConfigured": bool(advisor.gemini_api_key),
-        "activeEngine": f"Google-Gemini ({advisor.gemini_model})" if advisor.gemini_api_key else "SmartBancs-Heuristic-Rule-Engine (Local)",
+        # Motor principal configurado; el que respondió cada inferencia va en metadata.engine
+        "configuredPrimaryEngine": advisor.gemini_model if advisor.gemini_api_key else HEURISTIC_ENGINE,
         "totalInferences": advisor.total_inferences,
         "geminiInferences": advisor.gemini_success_count,
-        "fallbackInferences": advisor.fallback_count
+        "fallbackInferences": advisor.fallback_count,
+        "consumer": consumer,
     }
 
 @app.post("/predict-recommendation")
@@ -48,7 +55,7 @@ def predict_recommendation(tx: TransactionInput):
         return {
             "success": True,
             "recommendation": recommendation,
-            "engine": recommendation.get("engine", advisor.model_name)
+            "engine": recommendation.get("engine"),
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -56,21 +63,31 @@ def predict_recommendation(tx: TransactionInput):
 @app.get("/model-info")
 def model_info():
     """
-    Metadatos para observabilidad y MLOps: drift, ciclo de vida y métricas.
+    Metadatos del modelo. Solo expone datos reales: contadores en memoria desde el arranque
+    del proceso. El drift de datos NO se calcula en este servicio.
     """
     return {
         "modelName": advisor.model_name,
         "modelVersion": advisor.model_version,
-        "primaryEngine": f"Google Gemini API ({advisor.gemini_model})",
-        "fallbackEngine": "Heuristic Financial Rules Engine",
+        "serviceVersion": SERVICE_VERSION,
+        "primaryEngine": advisor.gemini_model,
+        "fallbackEngine": HEURISTIC_ENGINE,
         "geminiConfigured": bool(advisor.gemini_api_key),
+        "geminiTimeoutSeconds": GEMINI_TIMEOUT_SECONDS,
         "supportedCategories": ["FOOD", "ENTERTAINMENT", "SERVICES", "SALARY", "SHOPPING", "TRANSFER"],
-        "dataDriftStatus": "NORMAL",
-        "confidenceThreshold": 0.85,
+        "recommendationTypes": sorted(VALID_TYPES),
+        # No hay cálculo de drift (PSI) implementado: no se reporta un estado inventado.
+        "dataDriftStatus": "not_implemented",
+        "dataDriftScore": None,
+        # No existe umbral de confianza aplicado ni lote de entrenamiento (Gemini + reglas).
+        "confidenceThreshold": None,
+        "trainingBatchVersion": None,
         "totalInferencesProcessed": advisor.total_inferences,
         "geminiSuccessCount": advisor.gemini_success_count,
         "fallbackCount": advisor.fallback_count,
-        "trainingBatchVersion": "2026.09-Q3"
+        "countersScope": "desde el arranque del proceso (en memoria)",
+        "queue": QUEUE_NAME,
+        "deadLetterQueue": DLQ_NAME,
     }
 
 if __name__ == "__main__":

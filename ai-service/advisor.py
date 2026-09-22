@@ -2,16 +2,27 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from typing import Dict, Any, Optional
 import requests
 from dotenv import load_dotenv
 
+from log_context import configure_logging
+
 # Cargar variables de entorno desde .env o el directorio raíz
 load_dotenv()
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
+configure_logging()
 logger = logging.getLogger("AI-Advisor")
+
+# Timeout real de la llamada HTTP a Gemini (segundos). Los mensajes de log lo citan desde aquí.
+GEMINI_TIMEOUT_SECONDS = 10.0
+HEURISTIC_ENGINE = "heuristic-fallback"
+# Valores aceptados por el enum de PostgreSQL en ai_recommendations.type
+VALID_TYPES = {"SPENDING_ALERT", "BUDGET_OPTIMIZATION", "INVESTMENT_OPPORTUNITY", "SAVINGS_ADVICE", "FRAUD_WARNING"}
+MAX_TITLE_LENGTH = 150  # ai_recommendations.title VARCHAR(150)
 
 class FinancialAdvisorModel:
     def __init__(self):
@@ -22,6 +33,7 @@ class FinancialAdvisorModel:
         self.total_inferences = 0
         self.gemini_success_count = 0
         self.fallback_count = 0
+        self._counters_lock = threading.Lock()
 
         if self.gemini_api_key:
             logger.info(f"[AI-INIT] Gemini API Key detectada. Motor principal activo: {self.gemini_model}")
@@ -53,6 +65,31 @@ class FinancialAdvisorModel:
                 logger.warning(f"[SELF-HEALING-JSON] Falló extracción regex de JSON: {e}")
 
         return None
+
+    def _validate_gemini_result(self, parsed: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Garantiza que la respuesta de Gemini cumple el contrato del backend
+        (enum de type, title <= 150, message no vacío, confidenceScore en [0,1]).
+        Si no lo cumple devuelve None y se usa el motor heurístico."""
+        rec_type = parsed.get("type")
+        if rec_type not in VALID_TYPES:
+            logger.warning(f"[GEMINI-API] type inválido '{str(rec_type)[:40]}'. Aplicando fallback a reglas locales.")
+            return None
+        message = parsed.get("message")
+        if not isinstance(message, str) or not message.strip():
+            logger.warning("[GEMINI-API] message vacío o no textual. Aplicando fallback a reglas locales.")
+            return None
+        title = parsed.get("title")
+        if not isinstance(title, str) or not title.strip():
+            title = "Recomendación SmartBancs"
+        parsed["title"] = title.strip()[:MAX_TITLE_LENGTH]
+        try:
+            score = float(parsed.get("confidenceScore", 0.95))
+        except (TypeError, ValueError):
+            score = 0.95
+        parsed["confidenceScore"] = min(max(score, 0.0), 1.0)
+        if not isinstance(parsed.get("metadata"), dict):
+            parsed["metadata"] = {}
+        return parsed
 
     def _call_gemini_api(self, tx_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
@@ -94,6 +131,7 @@ class FinancialAdvisorModel:
         )
 
         payload = {
+            "systemInstruction": {"parts": [{"text": system_instruction}]},
             "contents": [
                 {
                     "parts": [
@@ -115,7 +153,7 @@ class FinancialAdvisorModel:
         
         try:
             started = time.time()
-            response = requests.post(url, json=payload, headers=headers, timeout=10.0)
+            response = requests.post(url, json=payload, headers=headers, timeout=GEMINI_TIMEOUT_SECONDS)
             latency_ms = (time.time() - started) * 1000
             if response.status_code == 200:
                 resp_json = response.json()
@@ -125,31 +163,32 @@ class FinancialAdvisorModel:
                     if content_parts:
                         raw_text = content_parts[0].get("text", "")
                         parsed = self._clean_and_parse_json(raw_text)
-                        if parsed and "type" in parsed and "message" in parsed:
+                        if isinstance(parsed, dict):
+                            parsed = self._validate_gemini_result(parsed)
+                            if parsed is None:
+                                return None
                             parsed["accountNumber"] = str(tx_data.get("accountNumber"))
                             parsed["transactionId"] = tx_data.get("transactionId")
-                            parsed["engine"] = f"Google-Gemini ({self.gemini_model})"
-                            if "confidenceScore" not in parsed:
-                                parsed["confidenceScore"] = 0.95
-                            logger.info(f"[GEMINI-API] OK {self.gemini_model} en {latency_ms:.0f} ms (tx {tx_data.get('transactionId')})")
+                            parsed["engine"] = self.gemini_model
+                            logger.info(f"[GEMINI-API] OK {self.gemini_model} en {latency_ms:.0f} ms")
                             return parsed
-                logger.warning("[GEMINI-API] Respuesta 200 sin JSON válido. Aplicando fallback a reglas locales.")
+                logger.warning(f"[GEMINI-API] Respuesta 200 sin JSON válido en {latency_ms:.0f} ms. Aplicando fallback a reglas locales.")
             elif response.status_code == 429:
-                logger.warning("[GEMINI-API] Cuota excedida (HTTP 429 Rate Limit). Aplicando fallback a reglas locales.")
+                logger.warning(f"[GEMINI-API] Cuota excedida (HTTP 429 Rate Limit) en {latency_ms:.0f} ms. Aplicando fallback a reglas locales.")
             else:
-                logger.warning(f"[GEMINI-API] Error de API Gemini HTTP {response.status_code}: {response.text[:200]}")
+                logger.warning(f"[GEMINI-API] Error de API Gemini HTTP {response.status_code} en {latency_ms:.0f} ms: {response.text[:200]}. Aplicando fallback a reglas locales.")
         except requests.exceptions.Timeout:
-            logger.warning("[GEMINI-API] Timeout en llamada a Gemini (>10s). Aplicando fallback no bloqueante.")
+            logger.warning(f"[GEMINI-API] Timeout en llamada a Gemini (> {GEMINI_TIMEOUT_SECONDS:.0f} s). Aplicando fallback a reglas locales.")
         except Exception as ex:
-            logger.error(f"[GEMINI-API] Excepción al invocar Gemini: {str(ex)}")
+            logger.error(f"[GEMINI-API] Excepción al invocar Gemini ({type(ex).__name__}): {str(ex)[:200]}. Aplicando fallback a reglas locales.")
 
         return None
 
     def _heuristic_rule_fallback(self, tx_data: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Motor Heurístico de Alta Velocidad (Fallback Resiliente).
-        Garantiza que el microservicio jamás falle y responda en <1ms
-        cuando no hay API Key o si ocurre un timeout/error de red.
+        Motor heurístico local (fallback resiliente).
+        Reglas deterministas sin llamadas de red; se usa cuando no hay API key
+        o cuando Gemini falla (timeout, error HTTP o respuesta inválida).
         """
         amount = float(tx_data.get("amount", 0.0))
         category = str(tx_data.get("category", "TRANSFER")).upper()
@@ -165,7 +204,7 @@ class FinancialAdvisorModel:
                 "title": "Alerta de Consumo en Alimentación",
                 "message": f"Tu gasto de ${amount:.2f} en alimentación supera el 15% del promedio recomendado para esta semana.",
                 "confidenceScore": 0.945,
-                "engine": "SmartBancs-Heuristic-Rule-Engine",
+                "engine": HEURISTIC_ENGINE,
                 "metadata": {"category": category, "amount": amount, "thresholdExceeded": True, "riskLevel": "MEDIUM"}
             }
 
@@ -177,7 +216,7 @@ class FinancialAdvisorModel:
                 "title": "Optimización de Presupuesto en Entretenimiento",
                 "message": f"Consumo recreativo de ${amount:.2f} detectado. Mantener este gasto controlado te permitirá ahorrar hasta $150 al mes.",
                 "confidenceScore": 0.912,
-                "engine": "SmartBancs-Heuristic-Rule-Engine",
+                "engine": HEURISTIC_ENGINE,
                 "metadata": {"category": category, "suggestedMonthlySaving": 150.0, "riskLevel": "LOW"}
             }
 
@@ -189,7 +228,7 @@ class FinancialAdvisorModel:
                 "title": "Oportunidad de Inversión Automatizada",
                 "message": f"Con el ingreso reciente de ${amount:.2f}, puedes rentabilizar tu liquidez en un fondo a plazo fijo SmartBancs con tasa 9.5% E.A.",
                 "confidenceScore": 0.978,
-                "engine": "SmartBancs-Heuristic-Rule-Engine",
+                "engine": HEURISTIC_ENGINE,
                 "metadata": {"suggestedProduct": "CDT_DIGITAL", "projectedYield": "9.5% EA", "riskLevel": "LOW"}
             }
 
@@ -201,7 +240,7 @@ class FinancialAdvisorModel:
                 "title": "Regla de Ahorro Automático Activada",
                 "message": f"Tu saldo actual es de ${current_balance:.2f}. Te sugerimos apartar el 10% en tu alcancía digital para emergencias.",
                 "confidenceScore": 0.962,
-                "engine": "SmartBancs-Heuristic-Rule-Engine",
+                "engine": HEURISTIC_ENGINE,
                 "metadata": {"recommendedSavings": current_balance * 0.10, "riskLevel": "LOW"}
             }
 
@@ -213,7 +252,7 @@ class FinancialAdvisorModel:
                 "title": "Monitoreo de Seguridad Transaccional",
                 "message": f"Transacción de alto monto (${amount:.2f}) procesada exitosamente. Si no reconoces esta operación, bloquea tu cuenta de inmediato.",
                 "confidenceScore": 0.991,
-                "engine": "SmartBancs-Heuristic-Rule-Engine",
+                "engine": HEURISTIC_ENGINE,
                 "metadata": {"highValueFlag": True, "riskLevel": "HIGH"}
             }
 
@@ -225,7 +264,7 @@ class FinancialAdvisorModel:
                 "title": "Finanzas Inteligentes SmartBancs",
                 "message": f"Transacción de ${amount:.2f} registrada correctamente. Continúas dentro de tu meta mensual de gastos.",
                 "confidenceScore": 0.885,
-                "engine": "SmartBancs-Heuristic-Rule-Engine",
+                "engine": HEURISTIC_ENGINE,
                 "metadata": {"status": "ON_TRACK", "riskLevel": "LOW"}
             }
 
@@ -236,17 +275,24 @@ class FinancialAdvisorModel:
         2. Aplica Self-Healing JSON parser.
         3. Si no hay API Key o falla la llamada, conmuta automáticamente al motor heurístico.
         """
-        self.total_inferences += 1
-        
+        with self._counters_lock:
+            self.total_inferences += 1
+
         # 1. Intentar con Gemini
         if self.gemini_api_key:
             gemini_result = self._call_gemini_api(tx_data)
             if gemini_result:
-                self.gemini_success_count += 1
+                with self._counters_lock:
+                    self.gemini_success_count += 1
                 return gemini_result
+        else:
+            logger.info("[AI-INFERENCE] Sin GEMINI_API_KEY: usando motor heurístico local.")
 
-        # 2. Fallback de alta resiliencia
-        self.fallback_count += 1
-        return self._heuristic_rule_fallback(tx_data)
+        # 2. Fallback heurístico
+        with self._counters_lock:
+            self.fallback_count += 1
+        result = self._heuristic_rule_fallback(tx_data)
+        logger.info(f"[AI-INFERENCE] Recomendación generada por {HEURISTIC_ENGINE}: [{result['type']}]")
+        return result
 
 advisor = FinancialAdvisorModel()
