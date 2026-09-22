@@ -15,24 +15,8 @@
 ## 🏛️ 1. Arquitectura de la Solución
 
 ```
-+-------------------+      HTTP REST (<2s)       +-----------------------+
-|  React 18 + Vite  | ------------------------> |   Backend Core API    |
-| (Frontend Web App)|                           |  (NestJS + TypeORM)   |
-+-------------------+                           +-----------+-----------+
-                                                            |
-                  +-----------------------------------------+-----------------------------------+
-                  | Transacción Atómica / SELECT FOR UPDATE                                     | Evento Asíncrono no-bloqueante
-                  v                                                                             v
-      +------------------------+                                                   +-------------------------+
-      |  PostgreSQL 16 DB      |                                                   |   RabbitMQ Message Bus  |
-      |  (Saldos & Auditoría)  |                                                   |   (smartbancs.events)   |
-      +------------------------+                                                   +------------+------------+
-                  ^                                                                             |
-                  | Lote Transformado (Clean)                                                   v
-      +-----------+------------+                                                   +-------------------------+
-      |   Pipeline ETL Python  | <---------------- [ Bancs Core Legado ]           | AI Financial Advisor    |
-      |   (bancs_cleaned.json) |                   (bancs_raw_transactions.csv)    | (Python FastAPI Worker) |
-      +------------------------+                                                   +-------------------------+
+<img width="636" height="777" alt="image" src="https://github.com/user-attachments/assets/a2d47280-a1ba-42b9-a270-2856b02eb167" />
+
 ```
 
 ---
