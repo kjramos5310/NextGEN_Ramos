@@ -9,7 +9,7 @@ Se usó IA generativa de forma extensa, en dos etapas:
 1. **Primera versión del MVP**, con un IDE asistido por IA (Antigravity) y un modelo ligero para scaffolding.
 2. **Corrección de la arquitectura**, con un proceso trazable: base de conocimiento, RAG local, análisis de brechas contra el reto, correcciones con pruebas y una segunda revisión con un equipo de agentes. Esta etapa se hizo con Claude Code y todo su rastro está en el repositorio ([ANALISIS_BRECHAS.md](ANALISIS_BRECHAS.md), [revision/](revision/README.md) y el historial de commits).
 
-La IA escribió la mayor parte del código y de la documentación. El candidato definió el diseño de datos y el stack, diseñó el proceso de revisión, decidió qué hallazgos aplicaban y validó cada cambio con pruebas antes de aceptarlo.
+Las decisiones críticas de diseño son del candidato: arquitectura, modelo de datos, mensajería con RabbitMQ y uso de Gemini. La IA se usó para implementar esas decisiones y para las tareas repetitivas, y escribió la mayor parte del código y de la documentación. El candidato también diseñó el proceso de revisión, decidió qué hallazgos aplicaban y validó cada cambio con pruebas antes de aceptarlo.
 
 ## Herramientas
 
@@ -26,6 +26,7 @@ La IA escribió la mayor parte del código y de la documentación. El candidato 
 
 | Componente | Qué hizo la IA | Qué decidió o validó el candidato |
 | :--- | :--- | :--- |
+| Arquitectura | Implementación de la arquitectura definida; en la revisión, detección de brechas frente a las referencias (p. ej. outbox documentado pero no implementado). | Diseño de la solución según el reto: microservicios en contenedores, PostgreSQL como núcleo transaccional, RabbitMQ para que la IA no bloquee la transferencia, microservicio de IA con Gemini y respaldo local, integración asíncrona con Bancs. |
 | Base de datos | Scaffolding de entidades desde el DDL; en la corrección, tabla `outbox_events`, columna `idempotency_key` e índices únicos parciales. | Modelo de datos original (`accounts`, `transactions`, `ai_recommendations`), restricciones `CHECK`, `NUMERIC(18,2)` e índices; aceptación de los cambios de esquema. |
 | Backend transaccional | Primera versión (Antigravity, Haiku); en la corrección, outbox con *publisher confirms*, idempotencia, timeouts y reintentos por SQLSTATE, montos en `NUMERIC`, métricas (Claude Code). | Bloqueo pesimista con orden determinista de cuentas; selección de las brechas a corregir; ejecución de las pruebas. |
 | Microservicio de IA | Servicio FastAPI, consumidor RabbitMQ y motor de reglas (Antigravity); reintentos con DLQ, trazabilidad y reescritura de las reglas de respaldo para que solo usen datos reales (Claude Code). | Uso de un LLM alojado con respaldo por reglas; verificación de la API key con `ai-service/scripts/check_gemini.py`. |
