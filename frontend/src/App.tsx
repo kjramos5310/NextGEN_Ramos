@@ -140,7 +140,7 @@ export const App: React.FC = () => {
                       <ul className="text-xs text-slate-300 space-y-2.5">
                         <li className="flex items-start space-x-2">
                           <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 flex-shrink-0 mt-0.5" />
-                          <span><strong>Bloqueo Pesimista Ordenado:</strong> Prevención matemática de deadlocks en concurrencia (Coffman).</span>
+                          <span><strong>Bloqueo Pesimista Ordenado:</strong> Orden determinista de locks: evita la espera circular entre transferencias cruzadas.</span>
                         </li>
                         <li className="flex items-start space-x-2">
                           <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 flex-shrink-0 mt-0.5" />
