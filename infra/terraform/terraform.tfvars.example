@@ -1,0 +1,11 @@
+project_id        = "mi-proyecto-gcp"
+region            = "us-central1"
+zone              = "us-central1-a"
+github_repository = "kjramos5310/NextGEN_Ramos"
+
+# Opcional: sin key el ai-service responde con el motor de reglas
+gemini_api_key = ""
+gemini_model   = "gemini-3.6-flash"
+
+# Activar solo mientras se graba la demo del pico de quincena
+enable_simulation = false
