@@ -33,6 +33,8 @@ export const TransferModal: React.FC<TransferModalProps> = ({
   const [isLoading, setIsLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [successResult, setSuccessResult] = useState<any | null>(null);
+  // Una clave por intención de transferencia (por apertura del modal), reutilizada en reintentos
+  const [idempotencyKey] = useState(() => crypto.randomUUID());
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -58,7 +60,7 @@ export const TransferModal: React.FC<TransferModalProps> = ({
         amount: parsedAmount,
         category,
         description,
-      });
+      }, idempotencyKey);
 
       setSuccessResult(res);
       onSuccess();

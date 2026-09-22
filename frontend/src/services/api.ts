@@ -29,10 +29,11 @@ export const api = {
     amount: number;
     description?: string;
     category?: string;
-  }): Promise<Transaction> => {
+  }, idempotencyKey: string = crypto.randomUUID()): Promise<Transaction> => {
     const res = await fetch(`${API_BASE_URL}/transactions`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      // Idempotency-Key: un doble clic o un reintento de red con la misma clave no genera un segundo débito
+      headers: { 'Content-Type': 'application/json', 'Idempotency-Key': idempotencyKey },
       body: JSON.stringify(data),
     });
     if (!res.ok) {
