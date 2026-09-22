@@ -1,0 +1,4 @@
+# RAG local de la bóveda SmartBancs (probado con Python 3.11)
+chromadb>=1.5,<2
+sentence-transformers>=5.0,<6   # trae torch y transformers (backend e5)
+python-frontmatter>=1.1,<2
