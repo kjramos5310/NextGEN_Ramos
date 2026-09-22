@@ -15,6 +15,7 @@ export class MetricsService {
   public readonly dbErrorsCounter: client.Counter<string>;
   public readonly transactionRetriesCounter: client.Counter<string>;
   public readonly outboxPendingGauge: client.Gauge<string>;
+  public readonly dbPoolWaitingGauge: client.Gauge<string>;
 
   constructor() {
     this.registry = new client.Registry();
@@ -93,6 +94,12 @@ export class MetricsService {
       help: 'Eventos en outbox_events aún no publicados en RabbitMQ (backlog hacia IA y Bancs)',
       registers: [this.registry],
     });
+
+    this.dbPoolWaitingGauge = new client.Gauge({
+      name: 'smartbancs_db_pool_waiting_requests',
+      help: 'Peticiones esperando una conexión libre del pool (> 0 sostenido = pool agotado)',
+      registers: [this.registry],
+    });
   }
 
   recordHttpRequest(method: string, route: string, statusCode: number, durationSeconds: number) {
@@ -120,6 +127,11 @@ export class MetricsService {
 
   recordTransactionRetry(sqlstate: string) {
     this.transactionRetriesCounter.inc({ sqlstate });
+  }
+
+  setPoolStats(active: number, waiting: number) {
+    this.activeDbConnectionsGauge.set(active);
+    this.dbPoolWaitingGauge.set(waiting);
   }
 
   setOutboxPending(count: number) {
