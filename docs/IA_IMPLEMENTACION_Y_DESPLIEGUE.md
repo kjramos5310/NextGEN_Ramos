@@ -95,7 +95,7 @@ sequenceDiagram
   - Si la respuesta no cumple, se usa el fallback.
 - **Motor heurístico local** (`_heuristic_rule_fallback`): reglas deterministas por monto, categoría y proporción del saldo (umbrales explícitos al inicio de `advisor.py`), sin red. Solo afirma datos calculados de la transacción; su `confidenceScore` es un valor fijo (0.5), no una probabilidad calibrada, y `metadata.rule` indica qué regla se aplicó. Se usa cuando no hay key y cuando Gemini responde con error HTTP, 429, timeout, JSON inválido o un contrato inválido.
 - Cada recomendación lleva `engine`: el nombre del modelo de Gemini o `heuristic-fallback`. Es la fuente de verdad de qué motor respondió.
-- **Coste por evento con Gemini degradado:** no hay circuit breaker. Si Gemini está caído o lento, cada evento puede esperar hasta 15 s antes de caer al fallback, y eso limita el ritmo del consumidor. El circuit breaker es diseño (sección 2.3).
+- **Coste por evento con Gemini degradado:** no hay circuit breaker. Si Gemini está caído o lento, cada evento puede esperar hasta 15 s antes de caer al fallback, y eso limita el ritmo del consumidor. El circuit breaker es diseño (sección 2.4).
 
 **Endpoints** ([main.py](../ai-service/main.py)):
 
@@ -132,7 +132,7 @@ sequenceDiagram
 - **Métrica en Prometheus:** solo `smartbancs_ai_recommendation_duration_seconds{engine="gemini"|"heuristic"|"unknown"}`. La expone el **backend**, a partir de la latencia que reporta el ai-service. Cuenta también los reenvíos duplicados. Ejemplo de p95 por motor: `histogram_quantile(0.95, sum by (le, engine) (rate(smartbancs_ai_recommendation_duration_seconds_bucket[5m])))`.
 - **El ai-service no expone `/metrics`** y Prometheus no lo scrapea. Sus contadores están en memoria (`/health`, `/model-info`) y se reinician con el proceso.
 - **Logs** ([log_context.py](../ai-service/log_context.py)): son texto, no JSON. Cada línea que se emite mientras se procesa un evento lleva `corrId`, `txId` y `eventId`. Hay registros de la llamada a Gemini (latencia, 429, timeout, respuesta inválida), del uso del fallback, del POST al backend y de los envíos a la DLQ.
-- **Pruebas** ([test_consumer.py](../ai-service/tests/test_consumer.py), 16 pruebas con `pytest`):
+- **Pruebas** ([test_consumer.py](../ai-service/tests/test_consumer.py) y [test_confidence.py](../ai-service/tests/test_confidence.py), 20 pruebas con `pytest`):
   - ack con 2xx y con 409.
   - Reintentos ante 503.
   - DLQ tras 3 fallos, ante 4xx y ante un mensaje inválido.
@@ -172,7 +172,24 @@ El reto pide monitorear el *data drift*. Para un LLM consumido por API se monito
 
 Las comparaciones de distribución se calcularían offline sobre `transactions` y `ai_recommendations`, nunca en el camino del consumidor. La acción ante un cambio es revisar el prompt o las reglas, o fijar otra versión del modelo, siempre probándolo antes (sección 2.1).
 
-### 2.3. Gestión del consumo de recursos (R3.3f)
+### 2.3. Confianza baja: operaciones que el cliente debe confirmar
+
+`confidenceScore` no es la calidad del consejo sino **qué tan seguro está el modelo de haber interpretado la transacción**. El prompt le da criterios explícitos, en vez de un valor de ejemplo que el modelo copiaría:
+
+| Rango | Cuándo |
+|---|---|
+| 0.85 a 1.0 | Monto coherente con la categoría y descripción clara |
+| 0.6 a 0.85 | Datos coherentes pero con poco contexto (descripción genérica) |
+| Menos de 0.6 | Datos ambiguos o contradictorios: monto desproporcionado para la categoría (p. ej. más de $1.000 en alimentación), monto alto sin descripción o transacción que consume más del 50 % del saldo previo |
+
+Que la IA no logre interpretar una operación es en sí una señal de que la operación es atípica. Por eso, por debajo de 0.6 (`LOW_CONFIDENCE_THRESHOLD` en [advisor.py](../ai-service/advisor.py)):
+
+- **Implementado:** la recomendación pide al cliente confirmar si reconoce la operación, lleva `metadata.needsClientConfirmation = true` y `metadata.confidenceReason`, y la UI la resalta como "Operación atípica: requiere confirmación del cliente". La regla de alto monto del motor de respaldo también la marca. Si el modelo no informa confianza, no se asume alta (0.5).
+- **Diseño:** el backend escribe un evento `recommendation.confirmation_required` en el outbox y un servicio de notificaciones separado envía el correo o SMS al cliente ("¿Reconoces esta transacción?"). Es el mismo patrón que Bancs, sin tocar el camino de la transferencia.
+
+La confianza la estima el propio modelo y no es una probabilidad calibrada. En producción, la decisión de notificar se combinaría con reglas objetivas (monto contra categoría, proporción del saldo, cuenta destino nueva) y se ajustaría con la tasa de confirmaciones reales.
+
+### 2.4. Gestión del consumo de recursos (R3.3f)
 
 **Implementado:**
 

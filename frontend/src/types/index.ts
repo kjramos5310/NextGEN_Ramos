@@ -46,6 +46,10 @@ export type AIEngine = 'gemini-3.6-flash' | 'heuristic-fallback';
 export interface AIRecommendationMetadata {
   engine?: AIEngine | string;
   riskLevel?: string;
+  /** Razón de la confianza, según el modelo */
+  confidenceReason?: string;
+  /** Confianza baja o monto alto: la operación es atípica y el cliente debería confirmarla */
+  needsClientConfirmation?: boolean;
   [key: string]: unknown;
 }
 

@@ -25,6 +25,10 @@ GEMINI_TIMEOUT_SECONDS = float(os.getenv("GEMINI_TIMEOUT_SECONDS", "15"))
 HIGH_VALUE_THRESHOLD = 5000.0          # USD: monto que se trata como alerta de seguridad
 HIGH_SHARE_THRESHOLD = 0.30            # la transacción consume >= 30 % del saldo previo
 DISCRETIONARY_SHARE_THRESHOLD = 0.10   # gasto discrecional >= 10 % del saldo previo
+# Por debajo de este valor la recomendación se marca como "requiere confirmación del cliente"
+LOW_CONFIDENCE_THRESHOLD = 0.6
+# Si el modelo no informa confianza no se asume una alta
+LOW_CONFIDENCE_DEFAULT = 0.5
 RULE_CONFIDENCE = 0.5                  # valor fijo para reglas: no es una probabilidad calibrada
 CATEGORY_ES = {"FOOD": "alimentación", "ENTERTAINMENT": "entretenimiento", "SHOPPING": "compras"}
 HEURISTIC_ENGINE = "heuristic-fallback"
@@ -91,10 +95,15 @@ class FinancialAdvisorModel:
             title = "Recomendación SmartBancs"
         parsed["title"] = title.strip()[:MAX_TITLE_LENGTH]
         try:
-            score = float(parsed.get("confidenceScore", 0.95))
+            score = float(parsed.get("confidenceScore", LOW_CONFIDENCE_DEFAULT))
         except (TypeError, ValueError):
-            score = 0.95
+            score = LOW_CONFIDENCE_DEFAULT
         parsed["confidenceScore"] = min(max(score, 0.0), 1.0)
+        # Confianza baja = el modelo no logró interpretar la operación: se trata como transacción
+        # atípica que el cliente debe confirmar (el envío de la notificación es diseño, ver docs)
+        meta = parsed.get("metadata") if isinstance(parsed.get("metadata"), dict) else {}
+        meta["needsClientConfirmation"] = parsed["confidenceScore"] < LOW_CONFIDENCE_THRESHOLD
+        parsed["metadata"] = meta
         if not isinstance(parsed.get("metadata"), dict):
             parsed["metadata"] = {}
         return parsed
@@ -116,8 +125,17 @@ class FinancialAdvisorModel:
             "'type' (uno de: 'SPENDING_ALERT', 'BUDGET_OPTIMIZATION', 'INVESTMENT_OPPORTUNITY', 'SAVINGS_ADVICE', 'FRAUD_WARNING'), "
             "'title' (título corto profesional en español), "
             "'message' (consejo financiero accionable o alerta clara en español, máximo 2 oraciones), "
-            "'confidenceScore' (número decimal entre 0.0 y 1.0 indicando nivel de confianza), "
-            "'metadata' (objeto con datos clave, e.g. suggestedAction, riskLevel: 'LOW'|'MEDIUM'|'HIGH')."
+            "'confidenceScore' (número entre 0.0 y 1.0), "
+            "'metadata' (objeto con riskLevel: 'LOW'|'MEDIUM'|'HIGH' y confidenceReason: una frase). "
+            "confidenceScore mide qué tan seguro estás de haber interpretado correctamente la transacción, "
+            "no la calidad del consejo. Criterios: "
+            "0.85 a 1.0 si el monto es coherente con la categoría y la descripción es clara; "
+            "0.6 a 0.85 si los datos son coherentes pero con poco contexto (descripción genérica); "
+            "menos de 0.6 si los datos son ambiguos o contradictorios: monto desproporcionado para la categoría "
+            "(por ejemplo más de $1,000 en alimentación o entretenimiento), monto alto con descripción vacía o genérica, "
+            "o una transacción que consume más del 50% del saldo previo. "
+            "Cuando la confianza sea menor a 0.6, usa type 'FRAUD_WARNING' o 'SPENDING_ALERT' y escribe un message "
+            "que pida al cliente confirmar si reconoce la operación. No inventes promedios, tasas ni metas."
         )
 
         prompt = (
@@ -126,15 +144,16 @@ class FinancialAdvisorModel:
             f"- Cuenta: {tx_data.get('accountNumber')}\n"
             f"- Monto: ${float(tx_data.get('amount', 0.0)):.2f}\n"
             f"- Categoría: {tx_data.get('category', 'TRANSFER')}\n"
-            f"- Saldo actual disponible: ${float(tx_data.get('currentBalance', 0.0)):.2f}\n"
+            f"- Saldo disponible tras la transacción: ${float(tx_data.get('currentBalance', 0.0)):.2f}\n"
+            f"- Saldo previo: ${float(tx_data.get('currentBalance', 0.0)) + float(tx_data.get('amount', 0.0)):.2f}\n"
             f"- Descripción: {tx_data.get('description', 'N/A')}\n\n"
             f"Formato JSON requerido:\n"
             f"{{\n"
             f'  "type": "SPENDING_ALERT" | "BUDGET_OPTIMIZATION" | "INVESTMENT_OPPORTUNITY" | "SAVINGS_ADVICE" | "FRAUD_WARNING",\n'
             f'  "title": "título profesional en español",\n'
             f'  "message": "consejo accionable contextualizado con saldo y porcentaje",\n'
-            f'  "confidenceScore": 0.95,\n'
-            f'  "metadata": {{"riskLevel": "LOW" | "MEDIUM" | "HIGH"}}\n'
+            f'  "confidenceScore": <número entre 0 y 1 según los criterios>,\n'
+            f'  "metadata": {{"riskLevel": "LOW" | "MEDIUM" | "HIGH", "confidenceReason": "una frase"}}\n'
             f"}}"
         )
 
@@ -229,6 +248,8 @@ class FinancialAdvisorModel:
                     "amount": round(amount, 2),
                     "shareOfBalance": round(share, 4),
                     "riskLevel": risk,
+                    # Solo la regla de alto monto pide confirmación al cliente
+                    "needsClientConfirmation": rule == "HIGH_VALUE",
                 },
             }
 

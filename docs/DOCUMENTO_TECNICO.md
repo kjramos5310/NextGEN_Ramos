@@ -497,7 +497,7 @@ Estados: **Implementado** = existe en el código y se puede ejecutar; **Diseño*
 | R3.3c | La IA no afecta la latencia | `TransactionsService` sin dependencia de broker ni IA; prueba unitaria del outbox en [transactions.service.spec.ts](../backend/src/modules/transactions/transactions.service.spec.ts) | Implementado (sin medición de carga) |
 | R3.3d | Ciclo de vida del modelo | [IA_IMPLEMENTACION_Y_DESPLIEGUE.md](IA_IMPLEMENTACION_Y_DESPLIEGUE.md) §2.1: datos por inferencia y versión del modelo por configuración | Parcial |
 | R3.3e | Data drift | Ídem §2.2: con un LLM consumido por API se monitorean entrada, salida y proveedor (métrica por `engine`, DLQ) | Parcial |
-| R3.3f | Consumo de recursos | Ídem §2.3 (prefetch, timeouts, límite de tokens y límites de CPU/memoria en Cloud Run) | Parcial |
+| R3.3f | Consumo de recursos | Ídem §2.4 (prefetch, timeouts, límite de tokens y límites de CPU/memoria en Cloud Run) | Parcial |
 | R3.4a | Log de transacciones exitosas | Sección 4.1 | Implementado |
 | R3.4b | Log de errores | Sección 4.1 | Implementado |
 | R3.4c | Log de llamadas a IA | `advisor.py`, `consumer.py` | Implementado |

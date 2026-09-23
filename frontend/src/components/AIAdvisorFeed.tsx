@@ -159,7 +159,7 @@ export const AIAdvisorFeed: React.FC<AIAdvisorFeedProps> = ({ recommendations, o
                   </div>
 
                   <div className="text-right flex flex-col items-end">
-                    <span className="text-[10px] font-mono font-bold text-blue-400">
+                    <span className={`text-[10px] font-mono font-bold ${Number(rec.confidenceScore) < 0.6 ? 'text-amber-400' : 'text-blue-400'}`}>
                       {(Number(rec.confidenceScore) * 100).toFixed(0)}% Confianza
                     </span>
                     <span className="text-[9px] text-slate-500 uppercase tracking-wider font-semibold">
@@ -169,6 +169,15 @@ export const AIAdvisorFeed: React.FC<AIAdvisorFeedProps> = ({ recommendations, o
                 </div>
 
                 <p className="text-xs text-slate-300 leading-relaxed mb-3">{rec.message}</p>
+
+                {rec.metadata?.needsClientConfirmation === true && (
+                  <div className="mb-3 px-2.5 py-1.5 rounded-md bg-amber-500/10 border border-amber-500/30 text-[11px] text-amber-300">
+                    Operación atípica: requiere confirmación del cliente
+                    {typeof rec.metadata.confidenceReason === 'string' && rec.metadata.confidenceReason && (
+                      <span className="block text-amber-200/80 mt-0.5">{rec.metadata.confidenceReason}</span>
+                    )}
+                  </div>
+                )}
 
                 <div className="flex items-center justify-between pt-2.5 border-t border-slate-800 text-[11px] text-slate-400">
                   <span className="font-mono text-[10px]">

@@ -169,7 +169,7 @@ npm run test:int
 
 La prueba crea una base aislada `smartbancs_test`, aplica `sql/schema.sql` y usa el `TransactionsService` real. Verifica, entre otras cosas, que 400 transferencias cruzadas en paralelo conservan el total sin saldos negativos, que 50 débitos simultáneos de $10 sobre $100 aprueban exactamente 10, que 20 reintentos con la misma `Idempotency-Key` debitan una sola vez, que la misma clave con otro payload da 422, que 300 transferencias de centavos conservan el total, que el pool agotado responde 503 con `POOL_TIMEOUT` y que el relay solo marca `published_at` en los eventos confirmados. El broker de RabbitMQ se sustituye por un stub en estas pruebas. Se conecta a `localhost:5432` con `postgres`/`postgrespassword`; se puede cambiar con `TEST_DB_HOST`, `TEST_DB_PORT`, `TEST_DB_USER` y `TEST_DB_PASSWORD`.
 
-**ai-service** (16 pruebas; sin red: no llama a Gemini ni a RabbitMQ):
+**ai-service** (20 pruebas; sin red: no llama a Gemini ni a RabbitMQ):
 
 ```bash
 cd ai-service
