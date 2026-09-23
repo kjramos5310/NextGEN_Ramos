@@ -191,8 +191,7 @@ def test_model_info_is_truthful():
     import main
     client = TestClient(main.app)  # sin context manager: no arranca el hilo consumidor
     info = client.get("/model-info").json()
-    assert info["dataDriftStatus"] == "not_implemented"
-    assert info["dataDriftScore"] is None
+    assert "dataDriftStatus" not in info  # no se reportan métricas de un modelo entrenado que no existe
     assert info["modelVersion"] == advisor.model_version
     from advisor import GEMINI_TIMEOUT_SECONDS
     assert info["geminiTimeoutSeconds"] == GEMINI_TIMEOUT_SECONDS

@@ -64,7 +64,7 @@ def predict_recommendation(tx: TransactionInput):
 def model_info():
     """
     Metadatos del modelo. Solo expone datos reales: contadores en memoria desde el arranque
-    del proceso. El drift de datos NO se calcula en este servicio.
+    del proceso. No hay modelo entrenado: se consume Gemini y un motor de reglas.
     """
     return {
         "modelName": advisor.model_name,
@@ -76,12 +76,6 @@ def model_info():
         "geminiTimeoutSeconds": GEMINI_TIMEOUT_SECONDS,
         "supportedCategories": ["FOOD", "ENTERTAINMENT", "SERVICES", "SALARY", "SHOPPING", "TRANSFER"],
         "recommendationTypes": sorted(VALID_TYPES),
-        # No hay cálculo de drift (PSI) implementado: no se reporta un estado inventado.
-        "dataDriftStatus": "not_implemented",
-        "dataDriftScore": None,
-        # No existe umbral de confianza aplicado ni lote de entrenamiento (Gemini + reglas).
-        "confidenceThreshold": None,
-        "trainingBatchVersion": None,
         "totalInferencesProcessed": advisor.total_inferences,
         "geminiSuccessCount": advisor.gemini_success_count,
         "fallbackCount": advisor.fallback_count,
