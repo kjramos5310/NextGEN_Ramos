@@ -14,9 +14,9 @@ El enunciado está en [docs/reto/reto-original.md](docs/reto/reto-original.md).
 
 ## Video demostrativo
 
-[![Video demostrativo de SmartBancs](https://img.youtube.com/vi/EM9LtEBHiWY/hqdefault.jpg)](https://youtu.be/EM9LtEBHiWY)
+[![Video demostrativo de SmartBancs](https://img.youtube.com/vi/lx-mufOpe-s/hqdefault.jpg)](https://youtu.be/lx-mufOpe-s)
 
-https://youtu.be/EM9LtEBHiWY
+https://youtu.be/lx-mufOpe-s
 
 ## Demo en vivo (Google Cloud Run)
 
