@@ -12,6 +12,14 @@ Además incluye observabilidad (logs con `x-correlation-id`, métricas Prometheu
 
 El enunciado está en [docs/reto/reto-original.md](docs/reto/reto-original.md).
 
+## Demo en vivo (Google Cloud Run)
+
+- **Aplicación:** https://smartbancs-frontend-2xefmftvmq-uc.a.run.app
+- **API:** https://smartbancs-backend-2xefmftvmq-uc.a.run.app/api/v1/accounts
+- **Métricas:** https://smartbancs-backend-2xefmftvmq-uc.a.run.app/metrics
+
+Desplegada con Terraform y el pipeline de GitHub Actions ([infra/README.md](infra/README.md)). Es un entorno de demostración, sin autenticación, y puede apagarse después de la evaluación. El entorno local (`docker compose up --build`) es equivalente.
+
 ## Arquitectura
 
 ```mermaid
