@@ -31,7 +31,16 @@ LOW_CONFIDENCE_THRESHOLD = 0.6
 # Si el modelo no informa confianza no se asume una alta
 LOW_CONFIDENCE_DEFAULT = 0.5
 RULE_CONFIDENCE = 0.5                  # valor fijo para reglas: no es una probabilidad calibrada
-CATEGORY_ES = {"FOOD": "alimentación", "ENTERTAINMENT": "entretenimiento", "SHOPPING": "compras"}
+CATEGORY_ES = {
+    "FOOD": "alimentación", "ENTERTAINMENT": "entretenimiento", "SHOPPING": "compras",
+    "SERVICES": "servicios", "SALARY": "nómina", "TRANSFER": "transferencias", "OTHER": "otros",
+}
+# Tipo de recomendación por defecto según la categoría de la transacción: un gasto de consumo
+# no debe etiquetarse como "plan de ahorro" solo porque no superó un umbral.
+DEFAULT_TYPE_BY_CATEGORY = {
+    "FOOD": "BUDGET_OPTIMIZATION", "ENTERTAINMENT": "BUDGET_OPTIMIZATION", "SHOPPING": "BUDGET_OPTIMIZATION",
+    "SERVICES": "BUDGET_OPTIMIZATION", "SALARY": "INVESTMENT_OPPORTUNITY",
+}
 HEURISTIC_ENGINE = "heuristic-fallback"
 # Valores aceptados por el enum de PostgreSQL en ai_recommendations.type
 VALID_TYPES = {"SPENDING_ALERT", "BUDGET_OPTIMIZATION", "INVESTMENT_OPPORTUNITY", "SAVINGS_ADVICE", "FRAUD_WARNING"}
@@ -289,8 +298,10 @@ class FinancialAdvisorModel:
                        f"Gasto de ${amount:,.2f} en {CATEGORY_ES.get(category, category.lower())}, el {pct:.0f}% de tu saldo previo. "
                        "Revisa si está dentro de tu presupuesto del mes.", "LOW")
 
-        return rec("DEFAULT", "SAVINGS_ADVICE", "Transacción registrada",
-                   f"Transacción de ${amount:,.2f} registrada ({pct:.1f}% de tu saldo previo). "
+        category_es = CATEGORY_ES.get(category, category.lower())
+        return rec("DEFAULT", DEFAULT_TYPE_BY_CATEGORY.get(category, "SAVINGS_ADVICE"),
+                   f"Movimiento en {category_es}",
+                   f"Transacción de ${amount:,.2f} en {category_es} registrada ({pct:.1f}% de tu saldo previo). "
                    f"Saldo disponible: ${balance_after:,.2f}.", "LOW")
 
     def analyze_transaction(self, tx_data: Dict[str, Any]) -> Dict[str, Any]:

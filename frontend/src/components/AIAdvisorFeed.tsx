@@ -40,6 +40,12 @@ export const AIAdvisorFeed: React.FC<AIAdvisorFeedProps> = ({ recommendations, o
           label: 'Alerta de Consumo',
           badgeClass: 'bg-amber-500/10 text-amber-400 border-amber-500/20',
         };
+      case 'BUDGET_OPTIMIZATION':
+        return {
+          icon: <Sparkles className="w-4 h-4 text-violet-400" />,
+          label: 'Presupuesto',
+          badgeClass: 'bg-violet-500/10 text-violet-400 border-violet-500/20',
+        };
       case 'INVESTMENT_OPPORTUNITY':
         return {
           icon: <TrendingUp className="w-4 h-4 text-blue-400" />,
@@ -100,6 +106,7 @@ export const AIAdvisorFeed: React.FC<AIAdvisorFeedProps> = ({ recommendations, o
         {[
           { id: 'ALL', label: 'Todas las Evaluaciones' },
           { id: 'SPENDING_ALERT', label: 'Alertas de Consumo' },
+          { id: 'BUDGET_OPTIMIZATION', label: 'Presupuesto' },
           { id: 'SAVINGS_ADVICE', label: 'Ahorro Automático' },
           { id: 'INVESTMENT_OPPORTUNITY', label: 'Inversión' },
           { id: 'FRAUD_WARNING', label: 'Seguridad' },
