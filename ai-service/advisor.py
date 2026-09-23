@@ -20,6 +20,7 @@ logger = logging.getLogger("AI-Advisor")
 # Timeout real de la llamada HTTP a Gemini (segundos). Los mensajes de log lo citan desde aquí.
 # La inferencia es asíncrona (fuera del camino crítico de la transferencia): se tolera más latencia
 GEMINI_TIMEOUT_SECONDS = float(os.getenv("GEMINI_TIMEOUT_SECONDS", "30"))
+GEMINI_COOLDOWN_SECONDS = float(os.getenv("GEMINI_COOLDOWN_SECONDS", "120"))
 
 # Umbrales del motor de reglas (fallback). Son parámetros de negocio explícitos, no aprendidos.
 HIGH_VALUE_THRESHOLD = 5000.0          # USD: monto que se trata como alerta de seguridad
@@ -42,6 +43,9 @@ class FinancialAdvisorModel:
         self.model_name = "SmartBancs-Gemini-Advisor"
         self.gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip()
         self.gemini_model = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+        # Circuit breaker: tras un 429, timeout o 5xx no se vuelve a llamar a Gemini durante
+        # GEMINI_COOLDOWN_SECONDS; mientras tanto responde el motor de reglas sin esperar.
+        self.gemini_open_until = 0.0
         self.total_inferences = 0
         self.gemini_success_count = 0
         self.fallback_count = 0
@@ -208,14 +212,25 @@ class FinancialAdvisorModel:
                 logger.warning(f"[GEMINI-API] Respuesta 200 sin JSON válido en {latency_ms:.0f} ms. Aplicando fallback a reglas locales.")
             elif response.status_code == 429:
                 logger.warning(f"[GEMINI-API] Cuota excedida (HTTP 429 Rate Limit) en {latency_ms:.0f} ms. Aplicando fallback a reglas locales.")
+                self._open_circuit("HTTP 429")
             else:
+                if response.status_code >= 500:
+                    self._open_circuit(f"HTTP {response.status_code}")
                 logger.warning(f"[GEMINI-API] Error de API Gemini HTTP {response.status_code} en {latency_ms:.0f} ms: {response.text[:600]}. Aplicando fallback a reglas locales.")
         except requests.exceptions.Timeout:
             logger.warning(f"[GEMINI-API] Timeout en llamada a Gemini (> {GEMINI_TIMEOUT_SECONDS:.0f} s). Aplicando fallback a reglas locales.")
+            self._open_circuit("timeout")
         except Exception as ex:
             logger.error(f"[GEMINI-API] Excepción al invocar Gemini ({type(ex).__name__}): {str(ex)[:200]}. Aplicando fallback a reglas locales.")
 
         return None
+
+    def _open_circuit(self, reason: str) -> None:
+        self.gemini_open_until = time.time() + GEMINI_COOLDOWN_SECONDS
+        logger.warning(f"[GEMINI-API] Circuit breaker abierto por {reason}: {GEMINI_COOLDOWN_SECONDS:.0f} s solo con motor de reglas.")
+
+    def gemini_circuit_open(self) -> bool:
+        return time.time() < self.gemini_open_until
 
     def _heuristic_rule_fallback(self, tx_data: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -288,8 +303,10 @@ class FinancialAdvisorModel:
         with self._counters_lock:
             self.total_inferences += 1
 
-        # 1. Intentar con Gemini
-        if self.gemini_api_key:
+        # 1. Intentar con Gemini (salvo que el circuit breaker esté abierto)
+        if self.gemini_api_key and self.gemini_circuit_open():
+            logger.info("[AI-INFERENCE] Circuit breaker abierto: se omite Gemini y responde el motor de reglas.")
+        elif self.gemini_api_key:
             gemini_result = self._call_gemini_api(tx_data)
             if gemini_result:
                 with self._counters_lock:

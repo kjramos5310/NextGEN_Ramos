@@ -331,7 +331,7 @@ Estas cifras validan la corrección bajo concurrencia y el SLA de < 2 s con cont
 | Outbox | La sección 2.1 | Una caída del broker o de la IA no afecta a la transferencia. |
 | Prueba automatizada | [concurrency.int-spec.ts](../backend/test/concurrency.int-spec.ts) (12 pruebas) | Conservación de saldos, doble gasto, montos al centavo, idempotencia, pool agotado → `503` + `POOL_TIMEOUT`, y relay con confirmaciones. |
 
-No está configurado: `idle_in_transaction_session_timeout` (se propone en la sección 6), circuit breaker, rate limiting en la API ni PgBouncer.
+No está configurado: `idle_in_transaction_session_timeout` (se propone en la sección 6), circuit breaker en la API (el ai-service sí tiene uno frente a Gemini), rate limiting en la API ni PgBouncer.
 
 ### 5.4. Cómo se identifica el proceso exacto (R3.5a–c, implementado)
 

@@ -34,3 +34,27 @@ def test_reglas_alto_monto_piden_confirmacion():
         {"amount": 20, "category": "OTHER", "currentBalance": 8000, "accountNumber": "1", "transactionId": "y"}
     )
     assert r["metadata"]["needsClientConfirmation"] is False
+
+
+def test_circuit_breaker_tras_429_omite_gemini(monkeypatch):
+    import advisor as mod
+
+    calls = {"n": 0}
+
+    class Resp:
+        status_code = 429
+        text = "quota"
+
+    def fake_post(*a, **k):
+        calls["n"] += 1
+        return Resp()
+
+    monkeypatch.setattr(mod.requests, "post", fake_post)
+    a = mod.FinancialAdvisorModel()
+    a.gemini_api_key = "x"
+    tx = {"amount": 50, "category": "FOOD", "currentBalance": 1000, "accountNumber": "1", "transactionId": "t"}
+    r1 = a.analyze_transaction(tx)
+    r2 = a.analyze_transaction(tx)
+    assert r1["engine"] == r2["engine"] == "heuristic-fallback"
+    assert calls["n"] == 1  # la segunda no llama a Gemini: circuito abierto
+    assert a.gemini_circuit_open()

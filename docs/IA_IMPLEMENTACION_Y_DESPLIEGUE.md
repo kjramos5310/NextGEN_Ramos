@@ -95,7 +95,7 @@ sequenceDiagram
   - Si la respuesta no cumple, se usa el fallback.
 - **Motor heurístico local** (`_heuristic_rule_fallback`): reglas deterministas por monto, categoría y proporción del saldo (umbrales explícitos al inicio de `advisor.py`), sin red. Solo afirma datos calculados de la transacción; su `confidenceScore` es un valor fijo (0.5), no una probabilidad calibrada, y `metadata.rule` indica qué regla se aplicó. Se usa cuando no hay key y cuando Gemini responde con error HTTP, 429, timeout, JSON inválido o un contrato inválido.
 - Cada recomendación lleva `engine`: el nombre del modelo de Gemini o `heuristic-fallback`. Es la fuente de verdad de qué motor respondió.
-- **Coste por evento con Gemini degradado:** no hay circuit breaker. Si Gemini está caído o lento, cada evento puede esperar hasta 30 s antes de caer al fallback, y eso limita el ritmo del consumidor. El circuit breaker es diseño (sección 2.4).
+- **Gemini degradado (circuit breaker, implementado):** tras un 429, un timeout o un 5xx, el servicio deja de llamar a Gemini durante `GEMINI_COOLDOWN_SECONDS` (120 s por defecto) y responde el motor de reglas al instante; así no se paga la espera de Gemini en cada evento. Pasado ese tiempo vuelve a intentar.
 
 **Endpoints** ([main.py](../ai-service/main.py)):
 
@@ -132,7 +132,7 @@ sequenceDiagram
 - **Métrica en Prometheus:** solo `smartbancs_ai_recommendation_duration_seconds{engine="gemini"|"heuristic"|"unknown"}`. La expone el **backend**, a partir de la latencia que reporta el ai-service. Cuenta también los reenvíos duplicados. Ejemplo de p95 por motor: `histogram_quantile(0.95, sum by (le, engine) (rate(smartbancs_ai_recommendation_duration_seconds_bucket[5m])))`.
 - **El ai-service no expone `/metrics`** y Prometheus no lo scrapea. Sus contadores están en memoria (`/health`, `/model-info`) y se reinician con el proceso.
 - **Logs** ([log_context.py](../ai-service/log_context.py)): son texto, no JSON. Cada línea que se emite mientras se procesa un evento lleva `corrId`, `txId` y `eventId`. Hay registros de la llamada a Gemini (latencia, 429, timeout, respuesta inválida), del uso del fallback, del POST al backend y de los envíos a la DLQ.
-- **Pruebas** ([test_consumer.py](../ai-service/tests/test_consumer.py) y [test_confidence.py](../ai-service/tests/test_confidence.py), 20 pruebas con `pytest`):
+- **Pruebas** ([test_consumer.py](../ai-service/tests/test_consumer.py) y [test_confidence.py](../ai-service/tests/test_confidence.py), 21 pruebas con `pytest`):
   - ack con 2xx y con 409.
   - Reintentos ante 503.
   - DLQ tras 3 fallos, ante 4xx y ante un mensaje inválido.
@@ -202,7 +202,7 @@ La confianza la estima el propio modelo y no es una probabilidad calibrada. En p
 
 **En Google Cloud:** Cloud Run fija 1 vCPU y 512 MiB para el ai-service, con una sola instancia ([run.tf](../infra/terraform/run.tf)).
 
-**No implementado:** límites en docker compose, autoescalado por cola, control de cuota RPM, circuit breaker y caché.
+**No implementado:** límites en docker compose, autoescalado por cola, control de cuota RPM y caché.
 
 **Diseño:**
 
@@ -210,7 +210,7 @@ La confianza la estima el propio modelo y no es una probabilidad calibrada. En p
 2. **Autoescalado por cola** (KEDA sobre la profundidad de `smartbancs.ai.queue`), con un mínimo y un máximo de réplicas. El máximo lo fija la cuota de Gemini y la capacidad del backend para recibir los POST, no solo la cola.
 3. **Cuota y costo de Gemini:**
    - *Token bucket* compartido (p. ej. en Redis) con el RPM contratado.
-   - Circuit breaker: tras N fallos o 429 seguidos, se usa directamente el fallback durante T segundos, lo que evita pagar el timeout de Gemini por evento.
+   - Circuit breaker: implementado en su forma simple (se abre con el primer 429, timeout o 5xx). En producción se abriría por tasa de fallos en una ventana y se compartiría su estado entre réplicas.
    - Presupuesto diario de tokens con alerta.
 4. **Priorización:** si hay backlog, se atienden primero los eventos recientes (una recomendación vieja pierde valor) o los de alto monto (posible fraude). Los eventos viejos se pueden procesar solo con el motor heurístico.
 5. **Caché** de perfiles de cliente y de respuestas para patrones repetidos (misma categoría y rango de monto), con TTL corto. Su beneficio se mide antes de adoptarla.

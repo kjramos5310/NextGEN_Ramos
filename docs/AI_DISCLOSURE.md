@@ -48,7 +48,7 @@ Las decisiones críticas de diseño son del candidato: arquitectura, modelo de d
 ## Validación
 
 - `backend`: `npm test` (31 pruebas unitarias) y `npm run test:int` (12 pruebas de concurrencia contra PostgreSQL real).
-- `ai-service`: `pytest` (20 pruebas).
+- `ai-service`: `pytest` (21 pruebas).
 - `frontend`: compilación con `tsc` y `vite build`.
 - ETL ejecutado con salida verificada.
 - Cada cambio se revisó como diff antes de aceptarlo. Generación y verificación se hicieron con herramientas o agentes distintos.
