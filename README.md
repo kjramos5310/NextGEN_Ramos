@@ -12,6 +12,12 @@ Además incluye observabilidad (logs con `x-correlation-id`, métricas Prometheu
 
 El enunciado está en [docs/reto/reto-original.md](docs/reto/reto-original.md).
 
+## Video demostrativo
+
+[![Video demostrativo de SmartBancs](https://img.youtube.com/vi/EM9LtEBHiWY/hqdefault.jpg)](https://youtu.be/EM9LtEBHiWY)
+
+https://youtu.be/EM9LtEBHiWY
+
 ## Demo en vivo (Google Cloud Run)
 
 - **Aplicación:** https://smartbancs-frontend-2xefmftvmq-uc.a.run.app
