@@ -40,7 +40,7 @@ La columna "Antes" es la foto del MVP v1 cuando se hizo este análisis; las refe
 | R3.5c Deadlocks | ⚠️ | Se detectan comparando texto del mensaje (`transactions.service.ts:141`) en vez del código SQLSTATE (**G3**) | ✅ por SQLSTATE, con reintento |
 | R3.5d / R3.6a–d Teórico | ✅ | `docs/DOCUMENTO_TECNICO.md` §5-6 | ✅ |
 | RNF-1 10k TPS | ⚠️ | Pool configurado (`max` 25-30), sin PgBouncer ni prueba de carga que lo respalde (**G5**) | ⚠️ sin cambios (**G5**) |
-| RNF-2 < 2 s | ✅ | Medido por histograma; `execution_time_ms` persistido | ✅ medido; sin prueba de carga versionada |
+| RNF-2 < 2 s | ✅ | Medido por histograma; `execution_time_ms` persistido | ✅ medido: p95 de 361 ms con 10.000 transferencias en la simulación de quincena |
 | RNF-3 IA no bloquea | ✅ | Despacho sin `await` bloqueante | ✅ la petición no toca RabbitMQ: responde tras el `COMMIT` |
 | RNF-4 Bancs sin alto volumen | ⚠️ | Solo se publica el evento; no hay rate limiting ni buffer reales (**G1**, **G8**) | ⚠️ cola durable sin consumidor (**G8**) |
 | E1–E3, E5 | ✅ | `docs/`, `README.md`, `AI_DISCLOSURE.md` | ✅ |

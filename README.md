@@ -190,7 +190,7 @@ Lee `bancs_raw_transactions.csv` (12 registros) y regenera `bancs_cleaned_featur
 | Salida del ETL | [etl-bancs/bancs_cleaned_features.json](etl-bancs/bancs_cleaned_features.json) | 9 registros limpios con variables para IA y metadatos de calidad. El script lo regenera. |
 | Pruebas de integración | [backend/test/concurrency.int-spec.ts](backend/test/concurrency.int-spec.ts) | Cuentas creadas por cada prueba en la base `smartbancs_test` (se trunca entre escenarios). |
 | Pruebas del ai-service | [ai-service/tests/test_consumer.py](ai-service/tests/test_consumer.py) | Mensajes AMQP y respuestas HTTP simuladas. |
-| Simulación de quincena | `POST /api/v1/simulation/quincena-spike` | Hasta 500 transferencias entre las cuentas semilla (`totalRequests` ≤ 500, `concurrentWorkers` ≤ 100). Requiere `SIMULATION_ENABLED=true`. |
+| Simulación de quincena | `POST /api/v1/simulation/quincena-spike` | De 1.000 a 10.000 transferencias concurrentes entre las cuentas semilla (`totalRequests` ≤ 10.000, `concurrentWorkers` ≤ 200, 50 por defecto). Devuelve TPS medidos, p95 y la suma de saldos antes y después. No genera recomendaciones de IA. Requiere `SIMULATION_ENABLED=true`. |
 
 ## Despliegue en Google Cloud
 

@@ -9,11 +9,22 @@
 - **Implementado:** existe en el repositorio. Se cita el archivo y la función.
 - **Diseño / propuesta:** es cómo se haría en producción. No está en el código del MVP.
 
-Las cifras de latencia o de TPS que aparecen son **objetivos** del enunciado o **techos calculados a partir de la configuración**. En el repositorio no hay resultados de pruebas de carga versionados. La sección 1.3 explica cómo medirlas.
+Las cifras de latencia o de TPS que aparecen son **objetivos** del enunciado, **techos calculados a partir de la configuración** o **mediciones de la simulación de quincena** (sección 5.2), indicando siempre en qué entorno se midieron.
+
+**Dónde está cada punto del reto:**
+
+| Reto | Tema | Sección |
+|---|---|---|
+| 3.1 | Infraestructura, base de datos y backend | [1](#1-reto-31-arquitectura-general-y-decisiones-técnicas) y [README](../README.md) |
+| 3.2 | Bancs: sincronización y ETL | [2](#2-reto-32-integración-con-el-core-legado-bancs-y-manejo-de-datos) |
+| 3.3 | Inteligencia artificial | [3](#3-reto-33-inteligencia-artificial-resumen) e [IA_IMPLEMENTACION_Y_DESPLIEGUE.md](IA_IMPLEMENTACION_Y_DESPLIEGUE.md) |
+| 3.4 | Observabilidad | [4](#4-reto-34-observabilidad-y-trazabilidad) |
+| 3.5 | Incidente crítico simulado (quincena) | [5](#5-reto-35-operaciones-incidente-crítico-simulado-de-quincena) |
+| 3.6 | Gestión de incidentes: escalamiento y post mortem | [6](#6-reto-36-gestión-de-incidentes-ti-escalamiento-y-post-mortem) |
 
 ---
 
-## 1. Arquitectura general y decisiones técnicas
+## 1. Reto 3.1: arquitectura general y decisiones técnicas
 
 ### 1.1. Diagrama de componentes (MVP)
 
@@ -119,7 +130,7 @@ El MVP **no demuestra** 10.000 TPS: corre en un solo host con un pool de 30 cone
 
 ---
 
-## 2. Integración con el core legado Bancs y manejo de datos
+## 2. Reto 3.2: integración con el core legado Bancs y manejo de datos
 
 ### 2.1. Flujo de datos SmartBancs → Bancs sin saturar el core
 
@@ -161,7 +172,7 @@ Procesa [bancs_raw_transactions.csv](../etl-bancs/bancs_raw_transactions.csv) (1
 
 ---
 
-## 3. Inteligencia artificial (resumen)
+## 3. Reto 3.3: inteligencia artificial (resumen)
 
 El detalle está en [IA_IMPLEMENTACION_Y_DESPLIEGUE.md](IA_IMPLEMENTACION_Y_DESPLIEGUE.md). Resumen de lo implementado:
 
@@ -175,11 +186,11 @@ El detalle está en [IA_IMPLEMENTACION_Y_DESPLIEGUE.md](IA_IMPLEMENTACION_Y_DESP
   - Valida la respuesta: `type` dentro del enum y `title` de hasta 150 caracteres.
   - Si no hay API key, o ante error, 429, timeout o respuesta inválida, usa el motor heurístico local.
 - **Persistencia idempotente:** `POST /api/v1/recommendations` deduplica por `transaction_id` (índice único `uq_ai_recs_transaction` + captura de `23505`).
-- **MLOps** (ciclo de vida, *data drift*, recursos): es **diseño**. Lo único implementado son contadores en memoria y `/model-info` con `dataDriftStatus: "not_implemented"`.
+- **Manejo del modelo** (ciclo de vida, monitoreo, recursos): no se entrena un modelo propio, se consume Gemini. Se monitorea la proporción de respuestas del motor de reglas frente a Gemini, la latencia por motor y la DLQ (implementado); la comparación de distribuciones de entrada y salida es diseño. Detalle en [IA_IMPLEMENTACION_Y_DESPLIEGUE.md](IA_IMPLEMENTACION_Y_DESPLIEGUE.md) §2.
 
 ---
 
-## 4. Observabilidad y trazabilidad
+## 4. Reto 3.4: observabilidad y trazabilidad
 
 ### 4.1. Instrumentación implementada
 
@@ -255,7 +266,7 @@ El resto de los paneles de la sección 4.2 son propuestas. Hasta que existan, se
 | Latencia HTTP por ruta | `histogram_quantile(0.95, sum by (le, route) (rate(http_request_duration_seconds_bucket[5m])))` | Localiza el problema: si solo la ruta de transferencias está lenta y las lecturas no, el problema está en la ruta de escritura. |
 | Disponibilidad del backend | `up{job="smartbancs-backend"}` | Scrape fallido = proceso caído o inaccesible. |
 | Logs con `correlationId` | (Loki/ELK, diseño) | Reconstruyen una transacción concreta: HTTP → BD → outbox → broker → IA → POST. |
-| `pg_stat_statements`, `log_lock_waits`, `db-diagnostics` | SQL (sección 5.3) | Dan la consulta y el PID exactos: la métrica dice *qué* pasa y estas fuentes dicen *dónde*. |
+| `pg_stat_statements`, `log_lock_waits`, `db-diagnostics` | SQL (sección 5.4) | Dan la consulta y el PID exactos: la métrica dice *qué* pasa y estas fuentes dicen *dónde*. |
 
 **Alertas: PROPUESTA, no configurada.** `prometheus.yml` no tiene `rule_files` ni `alerting`, y compose no incluye Alertmanager. Las reglas propuestas son estas:
 
@@ -282,7 +293,7 @@ Los umbrales son valores iniciales y se calibran con la línea base de producci�
 
 ---
 
-## 5. Operaciones: incidente de quincena (R3.5)
+## 5. Reto 3.5: operaciones, incidente crítico simulado de quincena
 
 ### 5.1. Escenario y mecanismo
 
@@ -293,7 +304,22 @@ El enunciado describe tres síntomas en un pico de quincena: latencia alta, time
 3. **Timeout de conexión.** Las peticiones siguientes esperan conexión en la cola de `pg-pool` hasta `connectionTimeoutMillis` (5 s, [app.module.ts](../backend/src/app.module.ts)) y fallan con "timeout exceeded when trying to connect".
 4. **Deadlocks.** Dos transferencias sobre las mismas cuentas no pueden hacer deadlock entre sí, porque ambas bloquean en el mismo orden. Un deadlock requiere otro proceso que escriba `accounts` en otro orden.
 
-### 5.2. Controles implementados en el código
+### 5.2. Simulación del pico en la aplicación
+
+La consola *Simulación de Quincena* del frontend (o `POST /api/v1/simulation/quincena-spike`, con `SIMULATION_ENABLED=true`) dispara entre 1.000 y 10.000 transferencias concurrentes (50 en vuelo a la vez) entre las cuentas semilla, a través del mismo `TransactionsService` que usa la API. Con solo 5 cuentas, todas las transferencias compiten por las mismas filas: es el peor caso de contención, el que describe el enunciado.
+
+Informa transferencias exitosas y fallidas, errores agrupados, latencia promedio y p95, **TPS medidos** y la **suma de saldos antes y después**, que debe ser idéntica (invariante ACID). La carga sintética no genera recomendaciones de IA, para no disparar miles de llamadas a Gemini; sí escribe el evento `bancs.sync` en el outbox, así que también se ve el backlog del relay (`smartbancs_outbox_pending_events`).
+
+**Medición de referencia** (una instancia del backend, PostgreSQL 16 local, pool de 30):
+
+| Transferencias | Exitosas | Duración | TPS medidos | p95 | Dinero total |
+|---|---|---|---|---|---|
+| 1.000 | 1.000 | 3,5 s | 287 | 480 ms | se conserva |
+| 10.000 | 10.000 | 24,9 s | 402 | 361 ms | se conserva |
+
+Estas cifras validan la corrección bajo concurrencia y el SLA de < 2 s con contención máxima. **No demuestran 10.000 TPS**: eso requiere escalar horizontalmente y repartir la carga entre muchas cuentas (sección 1.3).
+
+### 5.3. Controles implementados en el código
 
 | Control | Dónde | Efecto |
 | :--- | :--- | :--- |
@@ -307,7 +333,7 @@ El enunciado describe tres síntomas en un pico de quincena: latencia alta, time
 
 No está configurado: `idle_in_transaction_session_timeout` (se propone en la sección 6), circuit breaker, rate limiting en la API ni PgBouncer.
 
-### 5.3. Cómo se identifica el proceso exacto (R3.5a–c, implementado)
+### 5.4. Cómo se identifica el proceso exacto (R3.5a–c, implementado)
 
 - **Cuello de botella y consulta exacta (R3.5a):**
   - `GET /api/v1/simulation/db-diagnostics` (`SimulationService.getDatabaseDiagnostics`, requiere `SIMULATION_ENABLED=true`) devuelve lo siguiente:
@@ -323,7 +349,7 @@ No está configurado: `idle_in_transaction_session_timeout` (se propone en la se
   - El log de error del backend incluye `sqlstate`, `attempt` y `query`.
   - El log de PostgreSQL registra, gracias a `log_lock_waits` y a su propio detector de deadlocks, las sentencias y los PIDs involucrados.
 
-### 5.4. Acciones inmediatas (R3.5d, runbook)
+### 5.5. Acciones inmediatas (R3.5d, runbook)
 
 Principio: estabilizar primero y diagnosticar a fondo después. Los pasos van en orden de menor a mayor impacto.
 
@@ -344,7 +370,7 @@ Principio: estabilizar primero y diagnosticar a fondo después. Los pasos van en
 
 ---
 
-## 6. Gestión de incidentes TI: escalamiento y post mortem (R3.6)
+## 6. Reto 3.6: gestión de incidentes TI, escalamiento y post mortem
 
 ### 6.1. Proceso de escalamiento (R3.6b, propuesta de proceso)
 
@@ -444,7 +470,7 @@ Principio: estabilizar primero y diagnosticar a fondo después. Los pasos van en
 | 9 | Prueba de carga de quincena en **staging** antes de cada fecha pico (k6 + `quincena-spike`), con p95 y TPS versionados como evidencia | Proceso | QA / SRE | QA | Recurrente |
 | 10 | Ejecutar `npm run test:int` en CI en cada merge | Proceso | Código | Backend | Sprint 1 |
 
-**Información de soporte:** las consultas de la sección 5.3, el export del dashboard y los logs filtrados por `correlationId` de transacciones fallidas.
+**Información de soporte:** las consultas de la sección 5.4, el export del dashboard y los logs filtrados por `correlationId` de transacciones fallidas.
 
 ---
 
@@ -469,9 +495,9 @@ Estados: **Implementado** = existe en el código y se puede ejecutar; **Diseño*
 | R3.3a | Servicio de IA independiente | `ai-service/` | Implementado |
 | R3.3b | Consumo asíncrono | Outbox → relay → RabbitMQ → `consumer.py` | Implementado |
 | R3.3c | La IA no afecta la latencia | `TransactionsService` sin dependencia de broker ni IA; prueba unitaria del outbox en [transactions.service.spec.ts](../backend/src/modules/transactions/transactions.service.spec.ts) | Implementado (sin medición de carga) |
-| R3.3d | Ciclo de vida del modelo | [IA_IMPLEMENTACION_Y_DESPLIEGUE.md](IA_IMPLEMENTACION_Y_DESPLIEGUE.md) §2.1 | Diseño |
-| R3.3e | Data drift | Ídem §2.2 (`/model-info` devuelve `not_implemented`) | Diseño |
-| R3.3f | Consumo de recursos | Ídem §2.3 (implementados: prefetch, timeout y límite de tokens; límites de contenedor en diseño) | Parcial |
+| R3.3d | Ciclo de vida del modelo | [IA_IMPLEMENTACION_Y_DESPLIEGUE.md](IA_IMPLEMENTACION_Y_DESPLIEGUE.md) §2.1: datos por inferencia y versión del modelo por configuración | Parcial |
+| R3.3e | Data drift | Ídem §2.2: con un LLM consumido por API se monitorean entrada, salida y proveedor (métrica por `engine`, DLQ) | Parcial |
+| R3.3f | Consumo de recursos | Ídem §2.3 (prefetch, timeouts, límite de tokens y límites de CPU/memoria en Cloud Run) | Parcial |
 | R3.4a | Log de transacciones exitosas | Sección 4.1 | Implementado |
 | R3.4b | Log de errores | Sección 4.1 | Implementado |
 | R3.4c | Log de llamadas a IA | `advisor.py`, `consumer.py` | Implementado |
@@ -485,13 +511,13 @@ Estados: **Implementado** = existe en el código y se puede ejecutar; **Diseño*
 | R3.5a | Consulta exacta del cuello de botella | `db-diagnostics`, `pg_stat_statements`, logs | Implementado |
 | R3.5b | Timeouts de conexión | `POOL_TIMEOUT`, gauges del pool | Implementado |
 | R3.5c | Deadlocks | SQLSTATE `40P01`, `log_lock_waits`, reintentos | Implementado |
-| R3.5d | Acciones inmediatas | Sección 5.4 | Diseño (runbook) |
+| R3.5d | Acciones inmediatas | Sección 5.5 | Diseño (runbook) |
 | R3.6a | Estructura del post mortem | Sección 6.2 | Diseño |
 | R3.6b | Escalamiento | Sección 6.1 | Diseño |
 | R3.6c | Prevención en infraestructura | Sección 6.2 (acciones 3, 4, 5, 6, 8) | Diseño |
 | R3.6d | Prevención en código | Sección 6.2 (implementadas + acciones 1, 2, 7) | Parcial |
-| RNF-1 | 10.000 TPS | Sección 1.3 | Diseño (no medido en el MVP) |
-| RNF-2 | Transferencia < 2 s | Transferencia sin dependencias externas en el camino crítico; timeouts de 2 s (lock) y 5 s (sentencia, pool); métrica p95 | Parcial (mecanismos implementados; sin prueba de carga versionada) |
+| RNF-1 | 10.000 TPS | Sección 1.3 | Diseño. Medido en el MVP: 402 TPS con una instancia y 5 cuentas en máxima contención (sección 5.2) |
+| RNF-2 | Transferencia < 2 s | Transferencia sin dependencias externas en el camino crítico; timeouts de 2 s (lock) y 5 s (sentencia, pool); métrica p95 | Implementado: p95 de 361 ms con 10.000 transferencias concurrentes en la simulación (sección 5.2, entorno local) |
 | RNF-3 | La IA no bloquea | Outbox + cola (sección 2.1, sección 3) | Implementado |
 | RNF-4 | Bancs sin alto volumen directo | Cola durable implementada; worker con rate limiting y CDC en diseño | Parcial |
 | RNF-5 | Stack justificado | Secciones 1.2 y 1.4 | Diseño (documento) |

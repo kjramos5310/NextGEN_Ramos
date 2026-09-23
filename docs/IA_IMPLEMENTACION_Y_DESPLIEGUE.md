@@ -3,7 +3,7 @@
 Este documento cubre dos cosas:
 
 1. **Integración en código (práctico, R3.3a–c).** Qué está implementado y dónde.
-2. **Manejo del modelo en producción (teórico, R3.3d–f).** Ciclo de vida, *data drift* y gestión de recursos. Es **diseño**: cada punto indica si existe algo en el código o no.
+2. **Manejo del modelo en producción (teórico, R3.3d–f).** Ciclo de vida, monitoreo del comportamiento del modelo y gestión de recursos. Cada punto indica si está implementado o es diseño.
 
 Convención: **Implementado** significa que existe en el repositorio (se cita archivo y función). **Diseño** significa que no está en el código del MVP.
 
@@ -104,7 +104,6 @@ sequenceDiagram
   - Devuelve `geminiApiKeyConfigured`, `configuredPrimaryEngine`, los contadores de inferencias (total, Gemini, fallback) y el estado del consumidor (`connected`, `lastMessageAt`, `messagesAcked`, `messagesDeadLettered`).
 - `GET /model-info`:
   - `modelVersion: "v2.5.0-gemini-hybrid"`, `serviceVersion: "2.5.0"`, motor primario y de fallback, timeout, categorías, tipos, colas y contadores.
-  - `dataDriftStatus: "not_implemented"`, y `dataDriftScore`, `confidenceThreshold` y `trainingBatchVersion` en `null`: no se reportan valores inventados.
 - `POST /predict-recommendation`: inferencia síncrona bajo demanda, para pruebas. El backend no lo usa.
 
 **Backend receptor** ([recommendations.service.ts](../backend/src/modules/recommendations/recommendations.service.ts), `create`):
@@ -145,54 +144,33 @@ sequenceDiagram
 
 ---
 
-## 2. Manejo del modelo en producción (diseño, R3.3d–f)
+## 2. Manejo del modelo en producción (R3.3d–f)
 
-**Punto de partida real.** El "modelo" del MVP es un LLM alojado (Gemini) más un motor de reglas. **No hay un modelo entrenado por SmartBancs**, ni registro de modelos, ni pipeline de reentrenamiento. Lo que sigue describe cómo se gestionaría en producción.
+**Punto de partida.** SmartBancs **no entrena un modelo**: consume un LLM alojado (Gemini) y tiene un motor de reglas como respaldo. Por eso no hay reentrenamiento ni *data drift* en el sentido clásico de un modelo entrenado, donde las features de producción se alejan de las de entrenamiento. Lo que sí cambia con el tiempo son los datos que se le envían al modelo, el modelo que ofrece el proveedor y la calidad de sus respuestas. Eso es lo que se gestiona.
 
 ### 2.1. Ciclo de vida y alimentación con datos nuevos (R3.3d)
 
-```
-ETL diario (Bancs + SmartBancs) -> datos anonimizados -> Feature store
-        -> evaluación offline (conjunto de referencia) -> registro de versión
-        -> despliegue shadow / canary -> producción -> monitoreo (drift, calidad) -> vuelta al inicio
-```
+Con un LLM alojado, "alimentar el modelo con datos nuevos" significa darle en cada llamada el contexto de la transacción, no reentrenarlo:
 
-1. **Ingesta.**
-   - **Hoy existe:** [etl_bancs_processor.py](../etl-bancs/etl_bancs_processor.py). Deduplica, trata nulos, estandariza fechas y monedas, y genera `isHighValue`, `logAmount` y `channelRiskScore` sobre un CSV local. **No anonimiza** y su salida no la consume el ai-service.
-   - **Diseño:** ejecución programada (Airflow o similar) sobre los extractos de Bancs y la tabla `transactions`; hash con sal de los números de cuenta; features de comportamiento (frecuencia y gasto por categoría en ventanas de 7 y 30 días) en un feature store.
-2. **Versionado de lo que define el comportamiento.** Con un LLM alojado, lo que se versiona es el identificador del modelo (`GEMINI_MODEL`), el prompt y la instrucción de sistema, las reglas del fallback y el esquema de salida.
-   - **Hoy existe:** `model_version` (fijo en el código) y `GEMINI_MODEL` (variable de entorno).
-   - **Diseño:** cada combinación se registra como una versión (MLflow o un registro equivalente).
-3. **Evaluación antes de promover (diseño).**
-   - Un conjunto de referencia de transacciones etiquetadas por negocio: tipo de recomendación esperado y casos de fraude.
-   - Métricas: tasa de salida válida (contrato), acuerdo con las etiquetas y latencia p95.
-   - La versión candidata corre en *shadow* (sin mostrarse al cliente) y se compara con la vigente (*champion vs. challenger*) antes de un canary.
-4. **Modelo propio (diseño, opcional).** Si en el futuro se entrena un clasificador propio (p. ej. para fraude o categorización) sobre las features del ETL, el reentrenamiento sería periódico o disparado por drift (sección 2.2). Pasaría por las mismas etapas de evaluación y registro.
+1. **Datos por inferencia (implementado).** Cada evento `transaction.created` lleva monto, categoría, saldo y descripción. El prompt se arma con esos datos en cada llamada ([advisor.py](../ai-service/advisor.py), `_call_gemini_api`).
+2. **Más contexto (diseño).** Agregar al prompt un resumen del comportamiento reciente del cliente, como el gasto por categoría en los últimos 30 días, calculado a partir de `transactions` o de la salida del [ETL](../etl-bancs/etl_bancs_processor.py), sin enviar identificadores personales.
+3. **Versionado de lo que define el comportamiento.** El identificador del modelo (`GEMINI_MODEL`, variable de entorno), el prompt, la instrucción de sistema, las reglas de respaldo y el esquema de salida se versionan en el repositorio, y cada recomendación guarda en `metadata.engine` qué modelo la generó.
+4. **Cambio de versión del proveedor (caso real de este proyecto).** Google retiró `gemini-2.5-flash` para usuarios nuevos: la API empezó a responder 404 y todas las recomendaciones cayeron al motor de reglas. El servicio siguió funcionando, pero la señal de que algo cambió fue el aumento de `engine="heuristic"`. Un cambio de modelo se trata como un despliegue: se prueba con `ai-service/scripts/check_gemini.py` y con un conjunto de transacciones de referencia antes de cambiar `GEMINI_MODEL`.
 
-### 2.2. Monitoreo de *data drift* (R3.3e)
+### 2.2. Monitoreo del comportamiento del modelo (R3.3e)
 
-**Implementado:** nada que calcule drift. `/model-info` devuelve `dataDriftStatus: "not_implemented"`. Las únicas señales disponibles hoy son la proporción de `engine="heuristic"` frente a `engine="gemini"` en la métrica del backend y los contadores de `/health`.
+El reto pide monitorear el *data drift*. Para un LLM consumido por API se monitorean los datos de entrada, la salida y la salud del proveedor:
 
-**Diseño:**
+| Señal | Qué detecta | Estado |
+|---|---|---|
+| Proporción `engine="heuristic"` frente al modelo de Gemini (`smartbancs_ai_recommendation_duration_seconds{engine}` y contadores de `/health`) | Gemini no responde, cambió de versión, alcanzó la cuota o devuelve JSON inválido | Implementado |
+| Latencia de inferencia por motor (la misma métrica) | Degradación del proveedor | Implementado |
+| Mensajes en `smartbancs.ai.dlq` (`/health`: `messagesDeadLettered`) | Fallos del flujo de persistencia | Implementado |
+| Distribución de datos de entrada: categorías y rangos de monto del último día frente a una semana de referencia | Que el modelo reciba un tipo de transacción distinto del que se probó (por ejemplo, en quincena) | Diseño |
+| Distribución de los tipos de recomendación generados | Que el modelo empiece a responder distinto ante datos parecidos | Diseño |
+| Muestreo de recomendaciones para revisión humana | Calidad y tono de los mensajes al cliente | Diseño |
 
-1. **Drift de entrada (datos).** Un job diario compara la distribución de los últimos 7 días contra una ventana de referencia:
-   - **PSI** (*Population Stability Index*) para variables categorizadas: categoría, canal, deciles de monto.
-     `PSI = Σ (p_actual − p_ref) · ln(p_actual / p_ref)`.
-     Umbrales de referencia habituales:
-     - < 0.10: estable.
-     - 0.10–0.25: cambio moderado; se revisa.
-     - > 0.25: cambio significativo; se evalúa reentrenar o ajustar el prompt o las reglas.
-   - **Prueba de Kolmogorov–Smirnov** para variables continuas (monto, saldo).
-   - La quincena y las fechas especiales se comparan contra la misma fecha de periodos anteriores, para no alertar por estacionalidad esperada.
-2. **Drift de salida y de calidad** (el más útil con un LLM):
-   - Distribución de `type` de recomendación.
-   - Tasa de respuestas inválidas que caen al fallback.
-   - Tasa de 429 y timeouts.
-   - Distribución de `confidenceScore`.
-   - Tasa de mensajes en la DLQ.
-   - Muestreo periódico para revisión humana.
-3. **Dónde se calcula:** offline, sobre `transactions` y `ai_recommendations` (una réplica de lectura), nunca en el camino del consumidor. El resultado se publicaría como métrica (`ai_data_drift_psi{feature}`) y alimentaría `dataDriftStatus` en `/model-info`.
-4. **Acción:** alerta a MLOps → análisis → ajuste de prompt o reglas, o reentrenamiento → evaluación (sección 2.1). No se reentrena de forma automática sin evaluación.
+Las comparaciones de distribución se calcularían offline sobre `transactions` y `ai_recommendations`, nunca en el camino del consumidor. La acción ante un cambio es revisar el prompt o las reglas, o fijar otra versión del modelo, siempre probándolo antes (sección 2.1).
 
 ### 2.3. Gestión del consumo de recursos (R3.3f)
 
@@ -205,11 +183,13 @@ ETL diario (Bancs + SmartBancs) -> datos anonimizados -> Feature store
 - Fallback local ante 429, sin reintentar contra Gemini.
 - Cola durable como amortiguador: un pico de transferencias se convierte en backlog y no en carga simultánea.
 
-**No implementado:** límites de CPU y memoria del contenedor, autoescalado, control de cuota RPM, circuit breaker y caché.
+**En Google Cloud:** Cloud Run fija 1 vCPU y 512 MiB para el ai-service, con una sola instancia ([run.tf](../infra/terraform/run.tf)).
+
+**No implementado:** límites en docker compose, autoescalado por cola, control de cuota RPM, circuit breaker y caché.
 
 **Diseño:**
 
-1. **Límites por contenedor** (Kubernetes `requests`/`limits`, o `deploy.resources` en compose). Se dimensionan midiendo el consumo real bajo la simulación de quincena, no con valores fijados de antemano.
+1. **Límites por contenedor** (ya fijados en Cloud Run; en compose, `deploy.resources`). Se dimensionan midiendo el consumo real bajo la simulación de quincena, no con valores fijados de antemano.
 2. **Autoescalado por cola** (KEDA sobre la profundidad de `smartbancs.ai.queue`), con un mínimo y un máximo de réplicas. El máximo lo fija la cuota de Gemini y la capacidad del backend para recibir los POST, no solo la cola.
 3. **Cuota y costo de Gemini:**
    - *Token bucket* compartido (p. ej. en Redis) con el RPM contratado.
