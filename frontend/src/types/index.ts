@@ -61,6 +61,12 @@ export interface SimulationResult {
   maxLatencyMs: number;
   slaTargetUnder2s: boolean;
   errors: string[];
+  /** Transferencias completadas por segundo (medido en el backend) */
+  throughputTps?: number;
+  /** Suma de saldos antes y después (texto NUMERIC de PostgreSQL) */
+  totalMoneyBefore?: string;
+  totalMoneyAfter?: string;
+  moneyConserved?: boolean;
 }
 
 /** Respuesta de GET /simulation/db-diagnostics. Todos los campos son opcionales: la UI muestra "—" si faltan. */

@@ -81,7 +81,7 @@ export const api = {
   },
 
   // Operations & Incident Simulation
-  triggerQuincenaSpike: async (totalRequests = 30): Promise<SimulationResult> => {
+  triggerQuincenaSpike: async (totalRequests = 1000): Promise<SimulationResult> => {
     const res = await fetch(`${API_BASE_URL}/simulation/quincena-spike`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

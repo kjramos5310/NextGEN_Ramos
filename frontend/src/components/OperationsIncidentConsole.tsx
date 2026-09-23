@@ -8,7 +8,7 @@ const isNum = (v: unknown): v is number => typeof v === 'number' && Number.isFin
 const fmtMs = (v: unknown, digits = 0) => (isNum(v) ? v.toFixed(digits) : DASH);
 
 export const OperationsIncidentConsole: React.FC = () => {
-  const [totalRequests, setTotalRequests] = useState(30);
+  const [totalRequests, setTotalRequests] = useState(1000);
   const [isSimulating, setIsSimulating] = useState(false);
   const [simResult, setSimResult] = useState<SimulationResult | null>(null);
 
@@ -82,10 +82,10 @@ export const OperationsIncidentConsole: React.FC = () => {
                 onChange={(e) => setTotalRequests(Number(e.target.value))}
                 className="bg-transparent text-xs font-semibold text-white focus:outline-none"
               >
-                <option value={20} className="bg-slate-900">20 tx concurrentes</option>
-                <option value={40} className="bg-slate-900">40 tx concurrentes</option>
-                <option value={60} className="bg-slate-900">60 tx concurrentes</option>
-                <option value={100} className="bg-slate-900">100 tx concurrentes</option>
+                <option value={1000} className="bg-slate-900">1.000 transferencias</option>
+                <option value={2500} className="bg-slate-900">2.500 transferencias</option>
+                <option value={5000} className="bg-slate-900">5.000 transferencias</option>
+                <option value={10000} className="bg-slate-900">10.000 transferencias</option>
               </select>
             </div>
 
@@ -134,7 +134,14 @@ export const OperationsIncidentConsole: React.FC = () => {
             </div>
             <p className="text-[11px] text-slate-400 mt-2 font-mono">
               Duración total: {fmtMs(simResult.totalDurationMs)} ms
+              {isNum(simResult.throughputTps) && <> · {simResult.throughputTps} TPS medidos</>}
             </p>
+            {typeof simResult.moneyConserved === 'boolean' && (
+              <p className={`text-[11px] mt-1 font-mono ${simResult.moneyConserved ? 'text-emerald-400' : 'text-rose-400'}`}>
+                Dinero total: ${simResult.totalMoneyBefore} antes · ${simResult.totalMoneyAfter} después
+                {simResult.moneyConserved ? ' (se conserva)' : ' (NO se conserva)'}
+              </p>
+            )}
           </div>
 
           <div className="bank-card rounded-xl p-4">

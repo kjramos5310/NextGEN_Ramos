@@ -7,6 +7,8 @@ import { MetricsService } from '../../common/metrics/metrics.service';
 import { CustomLoggerService } from '../../common/logger/logger.service';
 
 const QUERY_TEXT_LIMIT = 200;
+const MAX_SIMULATED_TRANSFERS = 10000;
+const DEFAULT_WORKERS = 50;
 const IDLE_IN_TX_THRESHOLD_S = 5;
 const CRITICAL_BLOCKED = 10;
 const CRITICAL_POOL_WAITING = 10;
@@ -22,16 +24,19 @@ export class SimulationService {
   ) {}
 
   async runQuincenaSpike(options: { totalRequests?: number; concurrentWorkers?: number }) {
-    const total = Math.min(options.totalRequests || 30, 500);
-    const workers = Math.min(options.concurrentWorkers || total, total);
+    const total = Math.min(options.totalRequests || 1000, MAX_SIMULATED_TRANSFERS);
+    // Transferencias en vuelo a la vez. Por defecto 50: más que el pool (30) para generar
+    // contención real, sin disparar miles de promesas que solo esperarían conexión.
+    const workers = Math.min(options.concurrentWorkers || DEFAULT_WORKERS, total);
     const startTime = Date.now();
     const accounts = await this.accountsService.findAll();
+    const moneyBefore = await this.totalMoney();
 
     if (accounts.length < 2) {
       return { message: 'Se necesitan al menos 2 cuentas para la simulación' };
     }
 
-    this.logger.log(`[INCIDENT SIMULATION] Disparando pico transaccional de quincena con ${total} operaciones simultaneas...`);
+    this.logger.log(`[INCIDENT SIMULATION] Pico de quincena: ${total} transferencias con ${workers} en paralelo`);
 
     const tasks: Array<() => Promise<void>> = [];
     const results = {
@@ -39,7 +44,7 @@ export class SimulationService {
       successful: 0,
       failed: 0,
       latenciesMs: [] as number[],
-      errors: [] as string[],
+      errorCounts: new Map<string, number>(),
     };
 
     for (let i = 0; i < total; i++) {
@@ -64,6 +69,10 @@ export class SimulationService {
               category: TransactionCategory.SALARY,
             },
             corrId,
+            undefined,
+            // Carga sintética: no genera recomendaciones (serían miles de llamadas a Gemini).
+            // El evento hacia Bancs sí se escribe en el outbox.
+            { emitAiEvent: false },
           );
           const reqDuration = Date.now() - reqStart;
           results.successful++;
@@ -72,7 +81,8 @@ export class SimulationService {
           const reqDuration = Date.now() - reqStart;
           results.failed++;
           results.latenciesMs.push(reqDuration);
-          results.errors.push(err.message);
+          const key = String(err?.message ?? err).slice(0, 160);
+          results.errorCounts.set(key, (results.errorCounts.get(key) ?? 0) + 1);
         }
       });
     }
@@ -86,6 +96,7 @@ export class SimulationService {
     );
 
     const totalDurationMs = Date.now() - startTime;
+    const moneyAfter = await this.totalMoney();
     const sortedLatencies = [...results.latenciesMs].sort((a, b) => a - b);
     const avgLatency = sortedLatencies.length
       ? sortedLatencies.reduce((a, b) => a + b, 0) / sortedLatencies.length
@@ -110,8 +121,24 @@ export class SimulationService {
       minLatencyMs: sortedLatencies[0] || 0,
       maxLatencyMs: sortedLatencies[sortedLatencies.length - 1] || 0,
       slaTargetUnder2s: (p95Latency < 2000),
-      errors: results.errors.slice(0, 5),
+      // Invariante ACID: la suma de saldos no cambia, sin importar cuántas transferencias concurran
+      totalMoneyBefore: moneyBefore,
+      totalMoneyAfter: moneyAfter,
+      moneyConserved: moneyBefore === moneyAfter,
+      // Transferencias completadas por segundo durante la simulación (medido, no teórico)
+      throughputTps: totalDurationMs > 0 ? Number((results.successful / (totalDurationMs / 1000)).toFixed(1)) : 0,
+      // Errores agrupados por mensaje (p. ej. fondos insuficientes, 503 por contención)
+      errors: [...results.errorCounts.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 5)
+        .map(([message, count]) => `${message} (x${count})`),
     };
+  }
+
+  /** Suma de saldos calculada en PostgreSQL (NUMERIC), devuelta como texto para no perder precisión. */
+  private async totalMoney(): Promise<string> {
+    const [{ total }] = await this.dataSource.query(`SELECT COALESCE(SUM(balance), 0)::text AS total FROM accounts`);
+    return total;
   }
 
   /**

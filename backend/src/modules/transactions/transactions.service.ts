@@ -78,6 +78,9 @@ export class TransactionsService {
     dto: CreateTransactionDto,
     correlationId: string,
     idempotencyKey?: string,
+    // La carga sintética (simulación de quincena) no genera recomendaciones: evitaría miles
+    // de llamadas a Gemini. El evento hacia Bancs se escribe siempre.
+    options: { emitAiEvent?: boolean } = {},
   ): Promise<Transaction> {
     const startTime = Date.now();
     const { sourceAccountNumber, targetAccountNumber, amount } = dto;
@@ -98,7 +101,7 @@ export class TransactionsService {
             return previous;
           }
         }
-        return await this.executeTransfer(dto, correlationId, idempotencyKey, startTime);
+        return await this.executeTransfer(dto, correlationId, idempotencyKey, startTime, options.emitAiEvent ?? true);
       } catch (error) {
         const sqlstate = pgErrorCode(error);
         const poolTimeout = !sqlstate && isPoolTimeout(error);
@@ -167,6 +170,7 @@ export class TransactionsService {
     correlationId: string,
     idempotencyKey: string | undefined,
     startTime: number,
+    emitAiEvent: boolean,
   ): Promise<Transaction> {
     const { sourceAccountNumber, targetAccountNumber, amount, description, category, currency } = dto;
     const queryRunner: QueryRunner = this.dataSource.createQueryRunner();
@@ -259,7 +263,7 @@ export class TransactionsService {
 
       // TRANSACTIONAL OUTBOX (G1): los eventos se escriben en la MISMA transacción.
       // Si hay rollback no existen; si RabbitMQ está caído esperan en la tabla. No hay dual-write.
-      await queryRunner.manager.insert(OutboxEvent, this.buildOutboxEvents(createdTx, sourceAccount, correlationId));
+      await queryRunner.manager.insert(OutboxEvent, this.buildOutboxEvents(createdTx, sourceAccount, correlationId, emitAiEvent));
 
       await queryRunner.commitTransaction();
 
@@ -288,9 +292,14 @@ export class TransactionsService {
     return Array.isArray(rows) && rows.length > 0 ? String(rows[0].balance) : null;
   }
 
-  private buildOutboxEvents(tx: Transaction, sourceAccount: Account, correlationId: string): Partial<OutboxEvent>[] {
+  private buildOutboxEvents(
+    tx: Transaction,
+    sourceAccount: Account,
+    correlationId: string,
+    emitAiEvent = true,
+  ): Partial<OutboxEvent>[] {
     const base = { aggregateType: 'transaction', aggregateId: tx.id, correlationId };
-    return [
+    const events: Partial<OutboxEvent>[] = [
       {
         ...base,
         // Evento para el microservicio de IA (recomendación financiera)
@@ -320,6 +329,7 @@ export class TransactionsService {
         },
       },
     ];
+    return emitAiEvent ? events : events.filter((e) => e.eventType !== 'transaction.created');
   }
 
   async findAll(limit = 50): Promise<Transaction[]> {
