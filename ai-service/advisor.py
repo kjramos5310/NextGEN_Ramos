@@ -19,7 +19,7 @@ logger = logging.getLogger("AI-Advisor")
 
 # Timeout real de la llamada HTTP a Gemini (segundos). Los mensajes de log lo citan desde aquí.
 # La inferencia es asíncrona (fuera del camino crítico de la transferencia): se tolera más latencia
-GEMINI_TIMEOUT_SECONDS = float(os.getenv("GEMINI_TIMEOUT_SECONDS", "15"))
+GEMINI_TIMEOUT_SECONDS = float(os.getenv("GEMINI_TIMEOUT_SECONDS", "30"))
 
 # Umbrales del motor de reglas (fallback). Son parámetros de negocio explícitos, no aprendidos.
 HIGH_VALUE_THRESHOLD = 5000.0          # USD: monto que se trata como alerta de seguridad
@@ -168,7 +168,7 @@ class FinancialAdvisorModel:
             ],
             "generationConfig": {
                 "temperature": 0.2,
-                "maxOutputTokens": 800,
+                "maxOutputTokens": 2048,
                 "responseMimeType": "application/json",
                 "thinkingConfig": {
                     "thinkingBudget": 0

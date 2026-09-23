@@ -1,7 +1,8 @@
 """Verifica que la API key de Gemini funciona con el modelo configurado.
 
 Uso (desde la raíz del repo, con GEMINI_API_KEY y GEMINI_MODEL en .env):
-    python ai-service/scripts/check_gemini.py
+    python ai-service/scripts/check_gemini.py                 # $180 en FOOD
+    python ai-service/scripts/check_gemini.py 5000 FOOD       # caso atípico: confianza baja esperada
 
 Hace una inferencia real con una transacción de ejemplo usando el mismo código
 del servicio (advisor.py) e indica si respondió Gemini o el motor heurístico.
@@ -25,8 +26,8 @@ print(f"Modelo: {advisor.gemini_model} | key configurada ({len(advisor.gemini_ap
 tx = {
     "transactionId": "check-gemini",
     "accountNumber": "1000000001",
-    "amount": 180.0,
-    "category": "FOOD",
+    "amount": float(sys.argv[1]) if len(sys.argv) > 1 else 180.0,
+    "category": sys.argv[2].upper() if len(sys.argv) > 2 else "FOOD",
     "currentBalance": 850.0,
     "description": "Consumo restaurante",
 }
@@ -39,5 +40,7 @@ if result:
     print(f"  engine={result.get('engine')} type={result.get('type')}")
     print(f"  title={result.get('title')}")
     print(f"  message={result.get('message')}")
+    print(f"  confidenceScore={result.get('confidenceScore')} needsClientConfirmation={result.get('metadata', {}).get('needsClientConfirmation')}")
+    print(f"  confidenceReason={result.get('metadata', {}).get('confidenceReason')}")
 else:
     sys.exit(f"FALLO: Gemini no respondió ({ms:.0f} ms). Revisa el log [GEMINI-API] de arriba.")
